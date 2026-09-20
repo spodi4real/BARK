@@ -13,4 +13,7 @@ path = "src/main.rs"
 [dependencies]
 bark-core = { workspace = true }
 bark-crypto = { workspace = true }
+bark-net = { workspace = true }
 bark-proto = { workspace = true }
+
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "net", "time", "sync", "macros"] }

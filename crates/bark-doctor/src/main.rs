@@ -56,6 +56,9 @@ fn main() {
     section("VIDEO FRAME ASSEMBLY");
     measure_reassembly(&mut r);
 
+    section("QUIC TRANSPORT  (loopback only - see the note below)");
+    measure_network(&mut r);
+
     section("LATENCY ACCOUNTING");
     test_latency_maths(&mut r);
 
@@ -757,6 +760,212 @@ fn measure_reassembly(r: &mut Report) {
         frame.is_some() && losses.len() == 1,
         "frame 1 abandoned, frame 2 delivered immediately",
     );
+}
+
+// --------------------------------------------------------------- network
+
+/// Measures the QUIC layer over loopback.
+///
+/// **What these numbers are and are not.** Loopback has no propagation delay,
+/// no packet loss and an effectively unlimited link. So these figures measure
+/// BARK's own overhead — handshake work, stream setup, encryption, syscalls —
+/// and nothing about a real network. They are a *floor*: real latency is this
+/// plus the path. Their value is that a regression here is BARK's fault, with
+/// the network ruled out.
+fn measure_network(r: &mut Report) {
+    use bark_net::endpoint::{bidirectional_endpoint, connect, local_address, Role};
+    use bark_net::framing::{read_expected, write_message};
+    use bark_net::tls::{pinned_client_config, TransportCredentials};
+    use bark_proto::control::{ToNode, ToServer};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+        Ok(rt) => rt,
+        Err(e) => {
+            r.check("Start the network runtime", false, &format!("{e}"));
+            return;
+        }
+    };
+
+    rt.block_on(async {
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+
+        let server_creds = match TransportCredentials::generate() {
+            Ok(c) => c,
+            Err(e) => {
+                r.check("Create transport credentials", false, &format!("{e}"));
+                return;
+            }
+        };
+        let client_creds = TransportCredentials::generate().expect("client credentials");
+        let pin = server_creds.fingerprint();
+
+        field("Server fingerprint", &server_creds.fingerprint_text()[..39]);
+
+        let server = match bidirectional_endpoint(
+            bind,
+            &server_creds,
+            pinned_client_config(pin).expect("config"),
+            Role::Session,
+        ) {
+            Ok(e) => e,
+            Err(e) => {
+                r.check("Open a listening socket", false, &format!("{e}"));
+                return;
+            }
+        };
+        let server_addr = local_address(&server).expect("server address");
+        r.check("Open a listening socket", true, &format!("bound to {server_addr}"));
+
+        // Echo server: answers control messages and reflects datagrams.
+        let echo = tokio::spawn(async move {
+            let Some(incoming) = server.accept().await else { return };
+            let Ok(conn) = incoming.await else { return };
+
+            let datagram_conn = conn.clone();
+            tokio::spawn(async move {
+                while let Ok(bytes) = datagram_conn.read_datagram().await {
+                    if datagram_conn.send_datagram(bytes).is_err() {
+                        break;
+                    }
+                }
+            });
+
+            while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+                let msg: Option<ToServer> = read_expected(&mut recv).await.ok();
+                if let Some(ToServer::Ping { sent_us }) = msg {
+                    let _ = write_message(
+                        &mut send,
+                        &ToNode::Pong { sent_us, server_time_us: clock::now_us() },
+                    )
+                    .await;
+                    let _ = send.finish();
+                }
+            }
+        });
+
+        let client = bidirectional_endpoint(
+            bind,
+            &client_creds,
+            pinned_client_config(pin).expect("config"),
+            Role::Session,
+        )
+        .expect("client endpoint");
+
+        // --- connection establishment ---
+        let t0 = clock::now_us();
+        let conn = match connect(&client, server_addr, "the test server").await {
+            Ok(c) => c,
+            Err(e) => {
+                r.check("Establish a QUIC connection", false, &format!("{e}"));
+                return;
+            }
+        };
+        let connect_us = clock::now_us() - t0;
+        field("QUIC connection setup", &ns(connect_us as f64 * 1000.0));
+        r.check(
+            "Establish a QUIC connection",
+            true,
+            &format!("TLS 1.3 with a pinned certificate, {} us", connect_us),
+        );
+
+        // --- control message round trip ---
+        let mut rtt = LatencyWindow::new(128);
+        let mut control_ok = true;
+        for _ in 0..100 {
+            let t0 = clock::now_us();
+            let Ok((mut send, mut recv)) = conn.open_bi().await else {
+                control_ok = false;
+                break;
+            };
+            if write_message(&mut send, &ToServer::Ping { sent_us: t0 }).await.is_err() {
+                control_ok = false;
+                break;
+            }
+            let _ = send.finish();
+            match read_expected::<ToNode>(&mut recv).await {
+                Ok(ToNode::Pong { .. }) => rtt.push_us(clock::now_us() - t0),
+                _ => {
+                    control_ok = false;
+                    break;
+                }
+            }
+        }
+        r.check("Control messages round-trip", control_ok, &format!("{} exchanges", rtt.len()));
+        if !rtt.is_empty() {
+            field(
+                "Control round trip",
+                &format!(
+                    "median {} / p95 {}",
+                    ns(rtt.median_us() as f64 * 1000.0),
+                    ns(rtt.p95_us() as f64 * 1000.0)
+                ),
+            );
+        }
+
+        // --- datagram round trip: the path video actually takes ---
+        let mut dgram = LatencyWindow::new(256);
+        let payload = vec![0xC3u8; bark_proto::SAFE_DATAGRAM_PAYLOAD];
+        let mut dgram_ok = true;
+        for _ in 0..200 {
+            let t0 = clock::now_us();
+            if conn.send_datagram(payload.clone().into()).is_err() {
+                dgram_ok = false;
+                break;
+            }
+            match conn.read_datagram().await {
+                Ok(b) if b.len() == payload.len() => dgram.push_us(clock::now_us() - t0),
+                _ => {
+                    dgram_ok = false;
+                    break;
+                }
+            }
+        }
+        r.check(
+            "Unreliable datagrams work (the video path)",
+            dgram_ok && !dgram.is_empty(),
+            &format!("{} round trips of {} bytes", dgram.len(), payload.len()),
+        );
+        if !dgram.is_empty() {
+            field(
+                "Datagram round trip",
+                &format!(
+                    "median {} / p95 {} / jitter {}",
+                    ns(dgram.median_us() as f64 * 1000.0),
+                    ns(dgram.p95_us() as f64 * 1000.0),
+                    ns(dgram.jitter_us() as f64 * 1000.0)
+                ),
+            );
+            // Half the round trip is a rough one-way figure on a symmetric path.
+            let one_way = dgram.median_us() / 2;
+            r.check(
+                "Datagram overhead is small enough to ignore",
+                one_way < 1_000,
+                &format!("~{one_way} us one way on loopback, budget 1,000 us"),
+            );
+        }
+
+        field("Max datagram payload", &format!("{} bytes", conn.max_datagram_size().unwrap_or(0)));
+        r.check(
+            "Datagram size fits BARK's packet budget",
+            conn.max_datagram_size().unwrap_or(0) >= bark_proto::SAFE_DATAGRAM_PAYLOAD,
+            &format!(
+                "QUIC allows {}, BARK sends {}",
+                conn.max_datagram_size().unwrap_or(0),
+                bark_proto::SAFE_DATAGRAM_PAYLOAD
+            ),
+        );
+
+        conn.close(0u32.into(), b"done");
+        client.wait_idle().await;
+        echo.abort();
+    });
+
+    println!();
+    println!("  NOTE  These are loopback figures. They measure BARK's own overhead with");
+    println!("        the network removed, so they are a floor, not a prediction. Real");
+    println!("        latency is this plus the path. Hole punching, relay fallback and");
+    println!("        true round-trip times are not measured until those parts exist.");
 }
 
 // --------------------------------------------------------------- latency

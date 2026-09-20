@@ -114,7 +114,7 @@ responsiveness.
 | Measurement | Result |
 |---|---|
 | Fragments per 200 KB keyframe | **180**, each ≤ 1117 bytes |
-| Reassemble one keyframe | **178 µs** |
+| Reassemble one keyframe | **130–178 µs** (varies between runs) |
 
 **Largest CPU cost measured so far.** Still only ~1% of one core at 60 fps for
 1080p, and the check passes with a 4x margin against a quarter-frame budget. It
@@ -123,6 +123,33 @@ a pooled buffer. Not optimising it now — per the agreed approach, this gets
 revisited once real capture and encode exist and we can see whether it matters
 against the whole pipeline. Recorded here so the decision is made against a
 number rather than a guess.
+
+### QUIC transport — **loopback only**
+
+Read the caveat before the numbers. Loopback has no propagation delay, no loss
+and an unlimited link, so these measure **BARK's own overhead with the network
+removed**. They are a floor, not a prediction: real latency is this plus the
+path. Their value is that a regression here is BARK's fault, with the network
+ruled out as a cause.
+
+| Measurement | Result | Meaning |
+|---|---|---|
+| QUIC connection setup | **1.64 ms** | TLS 1.3 handshake with a pinned certificate. One-off per connection. |
+| Control message round trip | **median 45 µs, p95 121 µs** | Opening a stream, sending, replying, reading. |
+| **Datagram round trip** | **median 34 µs, p95 45 µs, jitter 5 µs** | The path video takes. ~17 µs one way. |
+| Max datagram payload offered | 1414 bytes | BARK currently sends 1117. |
+
+The datagram figure is the important one: **the transport adds roughly 17 µs
+each way to a video frame.** Against a 16.67 ms frame budget that is 0.1%, so
+the transport layer will not be what makes a session feel slow.
+
+**Follow-up noted, not acted on:** QUIC offered 1414-byte datagrams and BARK
+used 1117, because `SAFE_DATAGRAM_PAYLOAD` is a fixed conservative constant
+derived from QUIC's 1200-byte guaranteed minimum. Sizing fragments from the
+connection's actual `max_datagram_size()` would cut a 200 KB keyframe from 180
+fragments to about 145 — fewer packets, and fewer chances for one to be lost and
+cost a whole frame. Worth doing, but only once real capture and encode exist and
+the gain can be measured end to end rather than assumed.
 
 ### Latency accounting
 
@@ -144,7 +171,14 @@ Stated plainly so this document is not mistaken for more than it is:
 * **Screen capture latency** — no capture code exists yet.
 * **Encode latency** — no encoder exists yet. NVENC and QuickSync are both
   present on this machine but neither has been touched.
-* **Network RTT, loss, jitter, hole-punch success rate** — no networking yet.
+* **Real-network RTT, loss and jitter** — only loopback has been measured.
+* **NAT traversal** — hole punching is designed but not written, so its success
+  rate on real networks is unknown. This is the single biggest open question in
+  the project: if it fails often, sessions fall back to the relay and latency
+  rises by a whole extra hop.
+* **Relay fallback** — not written.
+* **Congestion control under loss** — BBR is configured on reasoning, not on
+  measurement. It has never been compared against Cubic on a real link.
 * **Decode and render latency** — not built.
 * **True input-to-photon latency** — the number that actually matters, and the
   one that can only be measured when every stage above exists.

@@ -7,12 +7,37 @@ license.workspace = true
 publish = false
 
 [dependencies]
+bark-core = { workspace = true }
+bark-crypto = { workspace = true }
+bark-proto = { workspace = true }
+
 bytes = "1.12.1"
-futures-util = "0.3.34"
-quinn = "0.11.9"
 rcgen = "0.14.7"
-rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
-rustls-pemfile = "2.2.0"
+# `platform-verifier` is deliberately off: BARK pins its own certificates and
+# has no use for the operating system trust store. Leaving it enabled would
+# pull in a second, unused verification path.
+quinn = { version = "0.11.9", default-features = false, features = [
+    "runtime-tokio",
+    "rustls-ring",
+    "log",
+    "bloom",
+] }
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std"] }
 rustls-pki-types = "1.15.1"
+serde = { version = "1.0.229", features = ["derive"] }
+sha2 = "0.10.9"
+hex = "0.4.3"
 socket2 = "0.6.5"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "net", "time", "sync", "macros", "io-util"] }
+tracing = "0.1.44"
+
+[dev-dependencies]
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "net", "time", "sync", "macros", "io-util", "test-util"] }
+
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.62.2"
+features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_Networking_WinSock",
+]
