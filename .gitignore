@@ -1,0 +1,16 @@
+# Build output. Large, regenerable, never committed.
+/target/
+**/*.rs.bk
+
+# Installer output
+/installer/out/
+
+# Local editor and OS clutter
+.vs/
+.vscode/
+*.user
+Thumbs.db
+desktop.ini
+
+# Anything a developer drops in a scratch folder
+/scratch/

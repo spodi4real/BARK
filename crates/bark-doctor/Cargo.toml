@@ -1,0 +1,16 @@
+[package]
+name = "bark-doctor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "bark-doctor"
+path = "src/main.rs"
+
+[dependencies]
+bark-core = { workspace = true }
+bark-crypto = { workspace = true }
+bark-proto = { workspace = true }

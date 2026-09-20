@@ -1,0 +1,13 @@
+[package]
+name = "bark-gui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "BARK"
+path = "src/main.rs"
+
+[dependencies]

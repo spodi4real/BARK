@@ -1,0 +1,60 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/bark-core",
+    "crates/bark-crypto",
+    "crates/bark-proto",
+    "crates/bark-net",
+    "crates/bark-media",
+    "crates/bark-input",
+    "crates/bark-transfer",
+    "crates/bark-winsvc",
+    "crates/bark-service",
+    "crates/bark-agent",
+    "crates/bark-doctor",
+    "crates/bark-gui",
+    "crates/bark-server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "Proprietary"
+authors = ["Bright Arrow"]
+publish = false
+
+[workspace.dependencies]
+bark-core = { path = "crates/bark-core" }
+bark-crypto = { path = "crates/bark-crypto" }
+bark-proto = { path = "crates/bark-proto" }
+bark-net = { path = "crates/bark-net" }
+bark-media = { path = "crates/bark-media" }
+bark-input = { path = "crates/bark-input" }
+bark-transfer = { path = "crates/bark-transfer" }
+bark-winsvc = { path = "crates/bark-winsvc" }
+
+# Release profile is tuned for latency-critical native code.
+# opt-level 3 + LTO + single codegen unit gives the encoder/packetiser hot paths
+# the best chance of inlining. panic=abort keeps the unwind tables out and makes
+# a panic in a media thread fail loudly instead of limping on with a poisoned lock.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "debuginfo"
+overflow-checks = false
+debug-assertions = false
+
+# Used for latency profiling: release-grade codegen but with symbols intact so
+# ETW / WPA traces and minidumps are readable.
+[profile.profiling]
+inherits = "release"
+strip = "none"
+debug = "line-tables-only"
+
+[profile.dev]
+opt-level = 1
+[profile.dev.package."*"]
+opt-level = 3

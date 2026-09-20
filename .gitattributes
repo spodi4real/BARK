@@ -1,0 +1,16 @@
+# Normalise line endings so the repository stays consistent regardless of who
+# checks it out or which editor they use. Without this, Windows checkouts
+# rewrite every file and diffs become unreadable.
+* text=auto eol=lf
+
+# Windows batch files are run by cmd.exe, which is happiest with CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Never touch these.
+*.png binary
+*.ico binary
+*.exe binary
+*.dll binary
+*.lib binary
+Cargo.lock text eol=lf
