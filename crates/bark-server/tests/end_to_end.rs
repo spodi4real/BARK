@@ -629,3 +629,102 @@ async fn reconnecting_replaces_the_earlier_session_without_losing_presence() {
 
     second.close().await;
 }
+
+#[tokio::test]
+async fn revoking_blocks_only_that_pair_and_re_pairing_lifts_it() {
+    // Regression test. The first server version turned one device's revocation
+    // into a network-wide ban on the revoked device.
+    let server = TestServer::start().await;
+    let laptop_id = DeviceIdentity::generate().expect("identity");
+    let office_id = DeviceIdentity::generate().expect("identity");
+    let other_id = DeviceIdentity::generate().expect("identity");
+
+    let mut laptop = login(&server, &laptop_id, "LAPTOP").await;
+    let mut office = login(&server, &office_id, "OFFICE-PC").await;
+    let mut other = login(&server, &other_id, "WAREHOUSE-PC").await;
+
+    // OFFICE-PC stops trusting LAPTOP, proving it with a signature.
+    let mut signed = Vec::new();
+    signed.extend_from_slice(laptop_id.fingerprint().as_bytes());
+    signed.extend_from_slice(office_id.fingerprint().as_bytes());
+    let sig = office_id.sign(bark_crypto::identity::context::REVOCATION, &signed);
+    office
+        .send(ToServer::Revoke { peer: laptop_id.fingerprint(), signature: sig.into() })
+        .await
+        .expect("revoke");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // LAPTOP can no longer be introduced to OFFICE-PC...
+    laptop
+        .send(ToServer::ConnectRequest {
+            target: office_id.fingerprint(),
+            request_id: 1,
+            candidates: vec![],
+        })
+        .await
+        .expect("request");
+    match wait_for(&mut laptop, |m| matches!(m, ToNode::ConnectResult { request_id: 1, .. })).await {
+        ToNode::ConnectResult { accepted, reason, .. } => {
+            assert!(!accepted);
+            assert_eq!(reason, Some(FailureReason::Revoked));
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+
+    // ...but is NOT banned from the network: still signed in, still able to
+    // reach a third machine.
+    assert!(server.state.registry.is_online(&laptop_id.fingerprint()));
+    let record = server.state.db.by_fingerprint(&laptop_id.fingerprint()).unwrap().unwrap();
+    assert!(!record.revoked, "a per-pair revocation must not ban the device");
+
+    laptop
+        .send(ToServer::ConnectRequest {
+            target: other_id.fingerprint(),
+            request_id: 2,
+            candidates: vec![],
+        })
+        .await
+        .expect("request");
+    let offer = wait_for(&mut other, |m| matches!(m, ToNode::ConnectOffer { .. })).await;
+    let ToNode::ConnectOffer { request_id: offer_id, .. } = offer else { unreachable!() };
+    other
+        .send(ToServer::ConnectAnswer { request_id: offer_id, accept: true, reason: None, candidates: vec![] })
+        .await
+        .expect("answer");
+    match wait_for(&mut laptop, |m| matches!(m, ToNode::ConnectResult { request_id: 2, .. })).await {
+        ToNode::ConnectResult { accepted, .. } => assert!(accepted, "other machines must still work"),
+        other => panic!("unexpected: {other:?}"),
+    }
+
+    // Re-pairing is still possible (it needs OFFICE-PC's code, i.e. its
+    // owner's consent), and it lifts the block.
+    laptop
+        .send(ToServer::PairRequest {
+            target: office_id.fingerprint(),
+            request_id: 3,
+            code_nonce: [1u8; 16],
+            code_digest: [2u8; 32],
+            our_name: "LAPTOP".into(),
+            machine: machine("LAPTOP"),
+        })
+        .await
+        .expect("pair request");
+    let offer = wait_for(&mut office, |m| matches!(m, ToNode::PairOffer { .. })).await;
+    let ToNode::PairOffer { request_id: pair_offer, .. } = offer else { unreachable!() };
+    office
+        .send(ToServer::PairAnswer {
+            request_id: pair_offer,
+            accept: true,
+            reason: None,
+            machine: Some(machine("OFFICE-PC")),
+            name: Some("OFFICE-PC".into()),
+        })
+        .await
+        .expect("pair answer");
+    let _ = wait_for(&mut laptop, |m| matches!(m, ToNode::PairResult { request_id: 3, .. })).await;
+
+    assert!(
+        !server.state.db.is_blocked(&office_id.fingerprint(), &laptop_id.fingerprint()).unwrap(),
+        "re-pairing must lift the revocation"
+    );
+}

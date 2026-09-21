@@ -7,15 +7,23 @@ Document version 1.0
 
 ## 1. Components
 
-BARK ships as **one installer** producing **one logical product** per machine. Internally it is
-four executables, because Windows forces a separation between services and interactive desktops.
+BARK ships as **one program, `BARK.exe`**, identical on every machine. Windows forces a
+separation between services and interactive desktops, so the same executable runs as several
+*processes*, chosen by how it is started:
 
-| Executable | Runs as | Purpose |
+| Started as | Runs as | Purpose |
 |---|---|---|
-| `bark-service.exe` | Windows Service, LocalSystem, auto-start | Owns device identity. Keeps the control connection to the coordination server. Authenticates incoming peers. Launches and supervises the session agent. Survives logout/lock/reboot. |
-| `bark-agent.exe`   | LocalSystem, inside the *interactive* Windows session | Screen capture, hardware encode, input injection, clipboard, privacy mode, input blocking. Re-launched automatically on session switch, logon, logoff, and desktop switch (e.g. to the secure/UAC desktop). |
-| `BARK.exe`         | Logged-in user | The classic Win32 GUI: favorites, pairing, settings, diagnostics, and the remote session window (decode + render + input capture). |
-| `bark-server.exe`  | Windows Service on the always-on company machine | Directory, presence, authentication, connection negotiation, NAT traversal assistance, relay fallback, device management, audit log. |
+| `BARK.exe` (double-click) | Logged-in user | The classic Win32 GUI: favorites, pairing, settings, diagnostics, and the remote session window (decode + render + input capture). If no BARK service is installed, it hosts the node itself ("standalone" mode, like a portable remote-access tool). |
+| `BARK.exe --service` | Windows Service, LocalSystem, auto-start | The **node**: owns the device identity, keeps the connection to the coordination server, authenticates peers, owns the one network socket, launches the session agent. Hosts the optional *coordination server* and *relay* roles. Survives logout/lock/reboot. |
+| `BARK.exe --agent` | LocalSystem, inside the *interactive* Windows session | Screen capture, encode, input injection, clipboard, privacy mode, input blocking. Launched by the service into whichever session is on the console; relaunched on logon, logoff, lock and desktop switch. |
+
+There is no separate server product and no separate relay product. Those are **roles** a normal
+installation can take on — see section 17.
+
+The GUI and the agent never touch the network or the private key. They talk to the service over
+local named pipes; the service is the only process with a socket and the only one that can sign.
+That keeps "one socket per device" (which NAT traversal depends on) and keeps the key in a
+SYSTEM-only process.
 
 ### Why a service *and* an agent
 
@@ -117,22 +125,41 @@ port-restricted NATs, and most symmetric NATs when only one side is symmetric).
 
 ## 6. Relay fallback
 
-If no candidate pair completes within ~1.5 seconds (both sides behind symmetric NAT, or a
-firewall that blocks UDP entirely), BARK falls back automatically.
+If no candidate pair completes within about two seconds (both sides behind symmetric NAT, or a
+firewall that blocks inbound UDP), BARK falls back automatically. **Connection: RELAYED.**
 
-Both devices already hold an open QUIC connection to the server. The server allocates a relay
-session and forwards datagrams between them. **Connection: RELAYED.**
+### How relaying works
 
-Two important properties:
+A relay is a **UDP packet forwarder**, nothing more. The two peers still run one end-to-end QUIC
+connection between themselves; the relay just moves its packets from one side to the other.
 
-* The relay forwards **already-end-to-end-encrypted** bytes. The server cannot read the screen,
-  the keystrokes, or the files. It is a dumb pipe.
-* Hole punching **continues in the background**. If a direct path becomes available (network
-  changed, VPN connected, moved to the office), the session **upgrades to direct mid-session**
-  without disconnecting, and the status bar changes from RELAYED to DIRECT.
+1. The controller asks the coordination server for a relay.
+2. The server picks a relay (section 17) and issues a **relay ticket** to each peer over their
+   authenticated control connections. The ticket names the relay, both peers' fingerprints, a
+   random session id and an expiry, and is **signed by the coordination server's device key**.
+3. Each peer sends a small *bind* packet carrying its ticket to the relay, from the same socket it
+   uses for everything else.
+4. The relay checks the signature against the coordination server's public key, checks the ticket
+   names *this* relay, checks expiry, and records the sender's address. Once both peers are bound
+   it forwards every packet from one to the other.
+5. The controller then opens its normal QUIC connection to the relay's address, and the relay
+   forwards it to the remote. Session code is identical for direct and relayed paths.
 
-If UDP is blocked entirely, the relay is reachable over QUIC-on-443 and, as a last resort, a
-TCP/TLS fallback on 443 so that BARK works even on hostile guest Wi-Fi.
+### Why the relay cannot read or hijack a session
+
+* The QUIC connection is end-to-end between the two peers. The relay sees ciphertext.
+* The session handshake is **bound to that QUIC connection** (TLS exporter channel binding, see
+  section 12). A relay that tried to terminate TLS itself and run two separate connections would
+  produce two different exporter values, and both peers' signatures would fail. So even a
+  malicious relay can only drop traffic — it can never read it, alter it or impersonate a peer.
+* A relay cannot be used as an open proxy: it forwards only between the two addresses that
+  presented valid, unexpired tickets signed by the pinned coordination server.
+
+Hole punching **continues in the background** on a relayed session; if a direct path appears, a
+new direct connection is established and the session moves to it (planned; see project state).
+
+UDP blocked entirely (some guest Wi-Fi) is not handled in the first version; a TCP/TLS fallback on
+port 443 is planned.
 
 ---
 
@@ -254,9 +281,21 @@ A dedicated QUIC stream, chunked with per-chunk BLAKE3 hashes.
 
 * **Identity**: Ed25519 per device, private key under DPAPI machine scope, never exported.
 * **Transport**: QUIC with TLS 1.3 to the server.
-* **Session**: an additional **end-to-end** handshake inside the tunnel — X25519 ECDH for key
-  agreement, Ed25519 signatures for authentication, ChaCha20-Poly1305 for the session.
+* **Session**: the peer-to-peer QUIC connection is TLS 1.3 end to end between the two devices.
+  Its certificates are not trusted for identity; instead a signed handshake (SIGMA: ephemeral
+  X25519 plus Ed25519 device signatures) runs as the first thing on the connection, and its
+  signed transcript includes the connection's **TLS exporter value** (RFC 5705 / RFC 9266
+  channel binding). Anyone terminating TLS in the middle — a hostile relay, a rogue server that
+  lied about addresses — ends up with two TLS sessions and two different exporter values, so the
+  signatures fail and the session is refused. Once the handshake succeeds, all session traffic
+  (video, input, clipboard, files) rides the channel-bound QUIC connection.
   **The server never holds session keys and cannot decrypt a session, relayed or not.**
+
+  *Design change, recorded honestly:* the first draft layered a second ChaCha20-Poly1305
+  encryption inside QUIC. Channel binding gives the same guarantee — only the two devices can
+  read the session, and a man in the middle is detected — without encrypting everything twice or
+  reimplementing datagram protection that QUIC already provides. The ChaCha20 session cipher in
+  `bark-crypto` remains tested and available but is not on the data path.
 * **Replay protection**: fresh random challenges plus per-message monotonic nonces.
 * **Brute-force protection**: pairing codes are rate-limited with exponential backoff, expire, and
   are single-use. Repeated failures lock pairing and raise an audit event.
@@ -354,3 +393,67 @@ built in from the first commit rather than added later.
 * No cloud dependency. The company's own server is the only infrastructure.
 * No modern SaaS visual design.
 * No AI branding of any kind.
+
+---
+
+## 17. Roles: one build, several capabilities
+
+Every machine runs the same `BARK.exe`. What differs is which **roles** an administrator has
+switched on in that machine's settings (stored in `C:\ProgramData\BARK\config.json`, writable only
+by administrators and the service).
+
+| Role | Default | What it does |
+|---|---|---|
+| **Node** | always on | Can be controlled (if it has paired controllers) and can control devices it has paired with. |
+| **Coordination server** | off; chosen at install ("This computer is the BARK server") | Device directory, presence, introductions, relay tickets. Needs one always-on machine. |
+| **Relay** | on for the coordination-server machine, off elsewhere | Forwards encrypted packets between two peers that cannot reach each other directly. |
+
+### Why relaying is opt-in rather than automatic on every PC
+
+Turning every desk PC into a relay would sound resilient but would be a bad trade:
+
+* **Resources.** A relayed 4K session is tens of megabits per second through someone's desk PC,
+  and its upload link. The owner of that PC did not ask for that.
+* **Reachability.** A relay only helps if *it* is reachable from both sides. A typical office PC
+  behind the same NAT as one peer is often no better placed than the peers themselves; relays
+  are useful precisely because they sit somewhere well connected.
+* **Exposure.** Every relay listens on an extra public UDP port. Fewer listeners is less attack
+  surface, even though a relay cannot be used to reach the machine it runs on.
+
+So relaying is a deliberate administrator choice per machine, with sensible defaults: the
+always-on server relays; anything else relays only if an administrator ticks "Allow this computer
+to relay connections for other BARK devices".
+
+### Choosing a relay, and what happens when it disappears
+
+Relay-capable nodes announce the capability when they sign in to the coordination server, along
+with a capacity limit. When a relay is needed the server picks, in order:
+
+1. The coordination server's own machine, if its relay role is on and it is under capacity.
+2. Any other online relay-capable node, least loaded first.
+
+If the chosen relay goes offline mid-session, the session drops, BARK's automatic reconnection
+asks again, and the server picks the next available relay. The operator sees a reconnect, not a
+dead session.
+
+### Security and resource controls on a relay
+
+* **No access to the relay machine.** The relay listens on its own port, separate from the
+  session endpoint. Packets arriving there are forwarded or dropped; they never reach the BARK
+  node's session logic, so relaying for others gives nobody any way into the relay machine.
+* **Tickets only.** Forwarding requires a ticket signed by the coordination server the relay
+  itself is pinned to, naming this relay, naming both peers, unexpired. No ticket, no forwarding.
+  A relay is never an open proxy.
+* **Contents unreadable.** Relayed traffic is end-to-end QUIC with a channel-bound handshake
+  (section 12). The relay machine cannot read the screen, keystrokes, clipboard or files, and a
+  malicious relay can only drop traffic, never read or alter it.
+* **Limits.** Maximum concurrent relayed sessions and a per-session bandwidth cap, configurable,
+  with conservative defaults. Idle bindings expire.
+* **Audited.** Every relay allocation is recorded in the coordination server's audit log.
+
+### Known limitation
+
+The coordination server itself is a single point of failure for *discovery*: if it is offline,
+devices cannot find each other or be introduced. Sessions already running are unaffected. Planned
+mitigations: nodes remember a peer's last working direct address and try it first, and a second
+coordination server can be designated later.

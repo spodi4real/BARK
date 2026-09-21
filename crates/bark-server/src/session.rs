@@ -461,6 +461,11 @@ async fn handle_request(ctx: &NodeContext, msg: ToServer) -> Result<bool> {
         ToServer::PairAnswer { request_id, accept, reason, machine, name } => {
             match reg.close_exchange(request_id, &me) {
                 Ok(route) => {
+                    if accept {
+                        // The owner has just re-admitted this device with a
+                        // pairing code, so any earlier revocation is lifted.
+                        let _ = db.unblock_pair(&me, &route.requester);
+                    }
                     push(
                         reg,
                         &route.requester,
@@ -505,10 +510,11 @@ async fn handle_request(ctx: &NodeContext, msg: ToServer) -> Result<bool> {
                 return Err(BarkError::crypto("revocation signature is not valid"));
             }
 
-            let changed = db.set_revoked(&peer, true)?;
-            let _ = db.audit(
-                &AuditEntry::new("revoke", changed).actor(me).target(peer),
-            );
+            // Per pair only: this device stops being introduced to `peer`.
+            // It must never ban `peer` from the rest of the network — that
+            // was a bug in the first version of this handler.
+            db.block_pair(&me, &peer)?;
+            let _ = db.audit(&AuditEntry::new("revoke", true).actor(me).target(peer));
         }
 
         ToServer::RelayRequest { request_id } => {
@@ -579,6 +585,21 @@ async fn prepare_introduction(
             return Ok(None);
         }
         Some(_) => {}
+    }
+
+    // A per-pair revocation stops connection introductions only. Pairing is
+    // still allowed through, because pairing needs the code shown on the
+    // owner's own screen: that is the owner deliberately restoring access,
+    // which is exactly how a revoked device is meant to be re-paired.
+    if kind == ExchangeKind::Connect && db.is_blocked(target, &me)? {
+        push(reg, &me, fail(FailureReason::Revoked));
+        let _ = db.audit(
+            &AuditEntry::new("introduce", false)
+                .actor(me)
+                .target(*target)
+                .detail("revoked by the target"),
+        );
+        return Ok(None);
     }
 
     if !reg.is_online(target) {

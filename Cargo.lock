@@ -143,6 +143,12 @@ dependencies = [
 [[package]]
 name = "bark-gui"
 version = "0.1.0"
+dependencies = [
+ "bark-core",
+ "bark-node",
+ "tracing",
+ "windows",
+]
 
 [[package]]
 name = "bark-input"
@@ -171,6 +177,23 @@ dependencies = [
  "tokio",
  "tracing",
  "windows",
+]
+
+[[package]]
+name = "bark-node"
+version = "0.1.0"
+dependencies = [
+ "bark-core",
+ "bark-crypto",
+ "bark-net",
+ "bark-proto",
+ "bark-server",
+ "quinn",
+ "serde",
+ "serde_json",
+ "time",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

@@ -9,6 +9,7 @@ members = [
     "crates/bark-input",
     "crates/bark-transfer",
     "crates/bark-winsvc",
+    "crates/bark-node",
     "crates/bark-service",
     "crates/bark-agent",
     "crates/bark-doctor",
@@ -33,6 +34,8 @@ bark-media = { path = "crates/bark-media" }
 bark-input = { path = "crates/bark-input" }
 bark-transfer = { path = "crates/bark-transfer" }
 bark-winsvc = { path = "crates/bark-winsvc" }
+bark-node = { path = "crates/bark-node" }
+bark-server = { path = "crates/bark-server" }
 
 # Release profile is tuned for latency-critical native code.
 # opt-level 3 + LTO + single codegen unit gives the encoder/packetiser hot paths

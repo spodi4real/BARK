@@ -1,0 +1,24 @@
+[package]
+name = "bark-node"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+bark-core = { workspace = true }
+bark-crypto = { workspace = true }
+bark-net = { workspace = true }
+bark-proto = { workspace = true }
+bark-server = { path = "../bark-server" }
+
+quinn = { version = "0.11.9", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+time = { version = "0.3.44", features = ["local-offset"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "net", "time", "sync", "macros"] }
+tracing = "0.1.44"
+
+[dev-dependencies]
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "net", "time", "sync", "macros", "test-util"] }

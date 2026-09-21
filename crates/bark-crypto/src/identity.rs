@@ -306,7 +306,18 @@ impl DeviceIdentity {
     /// and it is called by the service at startup. Returns whether a new
     /// identity was generated, so the caller can write the right audit entry.
     pub fn load_or_create() -> Result<(Self, bool)> {
-        let path = paths::identity_file();
+        paths::ensure_machine_dirs()?;
+        Self::load_or_create_at(&paths::identity_file())
+    }
+
+    /// Same as [`load_or_create`], for an identity kept somewhere other than
+    /// the machine directory — a standalone (not installed) copy of BARK keeps
+    /// its identity in the user's profile.
+    ///
+    /// Does not change folder permissions; that is the owner of the folder's
+    /// job, done once, never as a side effect of saving a file.
+    pub fn load_or_create_at(path: &std::path::Path) -> Result<(Self, bool)> {
+        let path = path.to_path_buf();
         if path.exists() {
             match Self::load_from(&path) {
                 Ok(id) => return Ok((id, false)),
@@ -324,7 +335,9 @@ impl DeviceIdentity {
                 }
             }
         }
-        paths::ensure_machine_dirs()?;
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
         let id = Self::generate()?;
         id.save_to(&path)?;
         Ok((id, true))

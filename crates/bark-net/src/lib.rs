@@ -18,6 +18,7 @@
 pub mod control;
 pub mod endpoint;
 pub mod framing;
+pub mod interfaces;
 pub mod tls;
 
 pub use control::{ControlConnection, PresenceTable, ServerGreeting};

@@ -196,6 +196,15 @@ impl Db {
 
             CREATE INDEX IF NOT EXISTS audit_time ON audit (unix_us DESC);
             CREATE INDEX IF NOT EXISTS audit_actor ON audit (actor);
+
+            -- One device's decision to stop trusting another. Affects only that
+            -- pair: the blocked device can still use every other BARK machine.
+            CREATE TABLE IF NOT EXISTS blocks (
+                owner   TEXT NOT NULL,
+                blocked TEXT NOT NULL,
+                unix_us INTEGER NOT NULL,
+                PRIMARY KEY (owner, blocked)
+            );
             "#,
         )
         .map_err(|e| sql_err("create its tables", e))?;
@@ -373,6 +382,48 @@ impl Db {
             out.push(r.map_err(|e| sql_err("read a device", e))??);
         }
         Ok(out)
+    }
+
+    /// Records that `owner` no longer accepts connections from `blocked`.
+    ///
+    /// This is *per pair*. It stops the server introducing `blocked` to
+    /// `owner`; it does not affect `blocked` anywhere else. Banning a device
+    /// from the whole network is a different, administrator-only action
+    /// ([`set_revoked`](Self::set_revoked)).
+    pub fn block_pair(&self, owner: &Fingerprint, blocked: &Fingerprint) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT OR REPLACE INTO blocks (owner, blocked, unix_us) VALUES (?1, ?2, ?3)",
+            params![owner.to_hex(), blocked.to_hex(), bark_core::clock::unix_us() as i64],
+        )
+        .map_err(|e| sql_err("record a revocation", e))?;
+        Ok(())
+    }
+
+    /// Lifts a per-pair block, which happens when the owner pairs with the
+    /// device again.
+    pub fn unblock_pair(&self, owner: &Fingerprint, blocked: &Fingerprint) -> Result<bool> {
+        let conn = self.lock()?;
+        let n = conn
+            .execute(
+                "DELETE FROM blocks WHERE owner = ?1 AND blocked = ?2",
+                params![owner.to_hex(), blocked.to_hex()],
+            )
+            .map_err(|e| sql_err("lift a revocation", e))?;
+        Ok(n > 0)
+    }
+
+    pub fn is_blocked(&self, owner: &Fingerprint, requester: &Fingerprint) -> Result<bool> {
+        let conn = self.lock()?;
+        let found: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM blocks WHERE owner = ?1 AND blocked = ?2",
+                params![owner.to_hex(), requester.to_hex()],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| sql_err("check a revocation", e))?;
+        Ok(found.is_some())
     }
 
     pub fn device_count(&self) -> Result<u64> {
@@ -574,6 +625,28 @@ mod tests {
 
         // Revoking something that is not there is not an error, just false.
         assert!(!db.set_revoked(&device().fingerprint(), true).unwrap());
+    }
+
+    #[test]
+    fn a_per_pair_block_affects_only_that_pair() {
+        let db = db();
+        let owner = device().fingerprint();
+        let blocked = device().fingerprint();
+        let bystander = device().fingerprint();
+
+        assert!(!db.is_blocked(&owner, &blocked).unwrap());
+        db.block_pair(&owner, &blocked).unwrap();
+        assert!(db.is_blocked(&owner, &blocked).unwrap());
+
+        // Direction matters, and nobody else is affected.
+        assert!(!db.is_blocked(&blocked, &owner).unwrap());
+        assert!(!db.is_blocked(&bystander, &blocked).unwrap());
+
+        // Blocking twice is harmless; unblocking restores it.
+        db.block_pair(&owner, &blocked).unwrap();
+        assert!(db.unblock_pair(&owner, &blocked).unwrap());
+        assert!(!db.is_blocked(&owner, &blocked).unwrap());
+        assert!(!db.unblock_pair(&owner, &blocked).unwrap(), "nothing left to lift");
     }
 
     #[test]
