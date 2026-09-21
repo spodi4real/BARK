@@ -16,4 +16,6 @@ bark-crypto = { workspace = true }
 bark-net = { workspace = true }
 bark-proto = { workspace = true }
 
+hex = "0.4.3"
+quinn = { version = "0.11.9", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "net", "time", "sync", "macros"] }

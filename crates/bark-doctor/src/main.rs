@@ -18,6 +18,14 @@ use bark_proto::Codec;
 use std::path::PathBuf;
 
 fn main() {
+    // `bark-doctor --server <address> --key <fingerprint>` tests a running
+    // coordination server from the outside, as a separate process. That is the
+    // one check the in-process test suite cannot make.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "--server") {
+        std::process::exit(server_check_from_args(&args));
+    }
+
     let mut r = Report::new();
 
     rule("BARK FOUNDATION SELF-TEST");
@@ -1005,4 +1013,245 @@ fn test_latency_maths(r: &mut Report) {
         w.median_us() < 10_000 && w.max_us() == 40_000,
         &format!("median {} us, p95 {} us, worst {} us", w.median_us(), w.p95_us(), w.max_us()),
     );
+}
+
+// ------------------------------------------------------- external server
+
+fn server_check_from_args(args: &[String]) -> i32 {
+    let value = |flag: &str| -> Option<String> {
+        args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1).cloned())
+    };
+
+    let Some(addr_text) = value("--server") else {
+        eprintln!("--server needs an address, for example --server 192.168.1.10:57411");
+        return 2;
+    };
+    let Some(key_text) = value("--key") else {
+        eprintln!("--key needs the server key printed by the BARK server");
+        return 2;
+    };
+
+    let address: std::net::SocketAddr = match addr_text.parse() {
+        Ok(a) => a,
+        Err(_) => {
+            eprintln!("\"{addr_text}\" is not an address and port, for example 192.168.1.10:57411");
+            return 2;
+        }
+    };
+    let key = match bark_net::tls::parse_fingerprint(&key_text) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("{e}");
+            return 2;
+        }
+    };
+
+    let nodes: usize = value("--nodes").and_then(|v| v.parse().ok()).unwrap_or(25);
+    server_check(address, key, nodes)
+}
+
+/// Tests a real coordination server over the network.
+///
+/// Uses throwaway identities named `BARK-DOCTOR-*`, which the server records
+/// like any other device. Point this at a test server rather than the
+/// production one, or those entries will appear in the device list. The
+/// Diagnostics panel will use the device's own identity instead.
+fn server_check(address: std::net::SocketAddr, key: [u8; 32], nodes: usize) -> i32 {
+    use bark_net::control::ControlConnection;
+    use bark_net::endpoint::{bidirectional_endpoint, local_address, Role};
+    use bark_net::tls::{pinned_client_config, TransportCredentials};
+    use bark_proto::control::{ToNode, ToServer};
+
+    let mut r = Report::new();
+    rule("BARK SERVER CONNECTIVITY TEST");
+    field("Server", &address.to_string());
+    field("Expected key", &hex::encode(&key[..8]));
+
+    let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("could not start the network runtime: {e}");
+            return 1;
+        }
+    };
+
+    rt.block_on(async {
+        let bind: std::net::SocketAddr = if address.is_ipv4() {
+            std::net::SocketAddr::from(([0, 0, 0, 0], 0))
+        } else {
+            std::net::SocketAddr::from(([0u16; 8], 0))
+        };
+
+        let make_endpoint = || -> bark_core::Result<quinn::Endpoint> {
+            let creds = TransportCredentials::generate()?;
+            bidirectional_endpoint(bind, &creds, pinned_client_config(key)?, Role::Control)
+        };
+
+        // ---- 1. sign in ----------------------------------------------------
+        section("SIGN-IN");
+        let id = match DeviceIdentity::generate() {
+            Ok(i) => i,
+            Err(e) => {
+                r.check("Create a test identity", false, &format!("{e}"));
+                return;
+            }
+        };
+        let endpoint = match make_endpoint() {
+            Ok(e) => e,
+            Err(e) => {
+                r.check("Open a network socket", false, &format!("{e}"));
+                return;
+            }
+        };
+        let local = local_address(&endpoint).ok();
+
+        let mut machine = MachineInfo::collect();
+        machine.hostname = "BARK-DOCTOR-TEST".into();
+
+        let t0 = clock::now_us();
+        let login = ControlConnection::login(
+            &endpoint,
+            address,
+            key,
+            &id,
+            machine,
+            local.into_iter().collect(),
+        )
+        .await;
+        let login_us = clock::now_us() - t0;
+
+        let mut conn = match login {
+            Ok(c) => c,
+            Err(e) => {
+                r.check("Sign in to the server", false, "");
+                println!();
+                println!("{}", e.explain());
+                return;
+            }
+        };
+        r.check(
+            "Sign in to the server",
+            true,
+            &format!("pinned key matched, signature accepted, {}", ns(login_us as f64 * 1000.0)),
+        );
+        field("Server version", &conn.greeting().server_version);
+        field("Server sees us at", &conn.public_address().to_string());
+
+        // ---- 2. round trip ---------------------------------------------------
+        section("ROUND TRIP TO THE SERVER");
+        let mut rtt = LatencyWindow::new(256);
+        let mut offset = ClockOffset::new();
+        let mut ping_ok = true;
+        for _ in 0..100 {
+            let sent = clock::now_us();
+            match conn.ping().await {
+                Ok((rt_us, server_time)) => {
+                    rtt.push_us(rt_us);
+                    offset.observe(sent, server_time, sent + rt_us);
+                }
+                Err(_) => {
+                    ping_ok = false;
+                    break;
+                }
+            }
+        }
+        r.check("Server answers pings", ping_ok, &format!("{} of 100", rtt.len()));
+        if !rtt.is_empty() {
+            field(
+                "Round trip",
+                &format!(
+                    "median {} / p95 {} / worst {} / jitter {}",
+                    ns(rtt.median_us() as f64 * 1000.0),
+                    ns(rtt.p95_us() as f64 * 1000.0),
+                    ns(rtt.max_us() as f64 * 1000.0),
+                    ns(rtt.jitter_us() as f64 * 1000.0),
+                ),
+            );
+            field(
+                "Clock calibration",
+                if offset.is_calibrated() { "calibrated" } else { "not enough samples" },
+            );
+        }
+
+        // ---- 3. directory ---------------------------------------------------
+        section("DIRECTORY");
+        let _ = conn.send(ToServer::Resolve { device_id: id.device_id() }).await;
+        let mut resolved = false;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), conn.next_event()).await {
+                Ok(Some(ToNode::Resolved { identity, .. })) => {
+                    resolved = identity == Some(id.public());
+                    break;
+                }
+                Ok(Some(_)) => continue,
+                _ => break,
+            }
+        }
+        r.check(
+            "Server registered this device",
+            resolved,
+            &format!("{} resolves to the right key", id.device_id()),
+        );
+
+        conn.close().await;
+        endpoint.wait_idle().await;
+
+        // ---- 4. many devices at once ------------------------------------------
+        section(&format!("CAPACITY  ({nodes} devices signing in at the same moment)"));
+        let started = clock::now_us();
+        let mut tasks = Vec::with_capacity(nodes);
+        for i in 0..nodes {
+            let Ok(ep) = make_endpoint() else { continue };
+            tasks.push(tokio::spawn(async move {
+                let id = DeviceIdentity::generate().ok()?;
+                let mut m = MachineInfo::collect();
+                m.hostname = format!("BARK-DOCTOR-{i:03}");
+                let t = clock::now_us();
+                let c = ControlConnection::login(&ep, address, key, &id, m, vec![]).await.ok()?;
+                let took = clock::now_us() - t;
+                c.close().await;
+                ep.wait_idle().await;
+                Some(took)
+            }));
+        }
+
+        let mut times = LatencyWindow::new(nodes.max(1));
+        for t in tasks {
+            if let Ok(Some(us)) = t.await {
+                times.push_us(us);
+            }
+        }
+        let wall = clock::now_us() - started;
+
+        r.check(
+            "Every device signed in",
+            times.len() == nodes,
+            &format!("{} of {nodes} in {}", times.len(), ns(wall as f64 * 1000.0)),
+        );
+        if !times.is_empty() {
+            field(
+                "Sign-in time under load",
+                &format!(
+                    "median {} / p95 {} / worst {}",
+                    ns(times.median_us() as f64 * 1000.0),
+                    ns(times.p95_us() as f64 * 1000.0),
+                    ns(times.max_us() as f64 * 1000.0),
+                ),
+            );
+        }
+    });
+
+    println!();
+    rule("RESULT");
+    if r.failed == 0 {
+        println!("  {} checks passed, 0 failed.", r.passed);
+    } else {
+        println!("  {} passed, {} FAILED.", r.passed, r.failed);
+        for f in &r.failures {
+            println!("  FAILED: {f}");
+        }
+    }
+    rule("");
+    i32::from(r.failed > 0)
 }

@@ -15,10 +15,12 @@
 //!   which is what makes NAT traversal possible.
 //! * [`framing`] — length-prefixed control messages on a stream.
 
+pub mod control;
 pub mod endpoint;
 pub mod framing;
 pub mod tls;
 
+pub use control::{ControlConnection, PresenceTable, ServerGreeting};
 pub use endpoint::{bidirectional_endpoint, client_only_endpoint, connect, local_address, Role};
 pub use framing::{read_expected, read_message, write_message};
 pub use tls::{parse_fingerprint, TransportCredentials};

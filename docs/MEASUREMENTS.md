@@ -151,6 +151,39 @@ fragments to about 145 — fewer packets, and fewer chances for one to be lost a
 cost a whole frame. Worth doing, but only once real capture and encode exist and
 the gain can be measured end to end rather than assumed.
 
+### Coordination server — real binary, separate process, loopback
+
+Measured by starting `bark-server.exe` as its own process and connecting to it
+from `bark-doctor.exe --server` in another. This is the first measurement of
+two BARK programs talking the way they will be deployed, rather than inside
+one test process. Still loopback, so the network itself is absent.
+
+| Measurement | Result | Meaning |
+|---|---|---|
+| Sign-in (QUIC + TLS + challenge signature + database write) | **21.5 ms** | Happens once, when the BARK service starts. Not on any interactive path. |
+| Control round trip to the server | **median 87 µs, p95 265 µs, jitter 22 µs** | Higher than the in-process 45 µs, as expected: a real process boundary and real socket buffers. |
+| 25 devices signing in at the same instant | **all 25 succeeded, 995 ms total** | A whole office rebooting after a power cut. |
+| Sign-in time under that load | **median 155 ms, worst 284 ms** | |
+| Server log after 26 sign-ins | **0 warnings, 0 errors** | 26 online, 26 offline, all accounted for. |
+| Server binary size | **4.6 MB** | Includes SQLite. Nothing else to install. |
+
+**Not yet explained:** one sign-in takes 21 ms alone but 155 ms when 25 arrive
+together, so something serialises them. Candidates are the single SQLite
+connection (each sign-in writes twice), TLS handshake CPU on the server, or the
+test client generating 25 certificates at once on the same machine. It has not
+been profiled, so it is recorded as unexplained rather than attributed to a
+guess. It does not matter for use — a device signs in once at boot, and even a
+simultaneous whole-office restart completes in under a second — but if a
+deployment ever grows to hundreds of devices, this is the first thing to
+profile.
+
+Also verified against the real binary:
+
+* The server key is **identical across restarts** (checked by running
+  `--join-info` twice against the same data folder).
+* A client holding the **wrong server key is refused** before signing in, with a
+  message that names the expected and received keys and says what to do.
+
 ### Latency accounting
 
 | Measurement | Result |
@@ -176,7 +209,10 @@ Stated plainly so this document is not mistaken for more than it is:
   rate on real networks is unknown. This is the single biggest open question in
   the project: if it fails often, sessions fall back to the relay and latency
   rises by a whole extra hop.
-* **Relay fallback** — not written.
+* **Relay fallback** — not written. The server answers a relay request with an
+  explicit "relay unavailable" rather than leaving the node waiting.
+* **A second physical computer** — every server test so far ran on this laptop.
+  Nothing has yet crossed a real network cable or Wi-Fi link.
 * **Congestion control under loss** — BBR is configured on reasoning, not on
   measurement. It has never been compared against Cubic on a real link.
 * **Decode and render latency** — not built.
