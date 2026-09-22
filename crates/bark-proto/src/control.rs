@@ -293,6 +293,9 @@ pub enum ToNode {
         token: [u8; 16],
     },
 
+    /// A relay could not be set up for `request_id`, and why.
+    RelayUnavailable { request_id: u64, detail: String },
+
     /// Something went wrong that was not tied to one request.
     Error { reason: FailureReason, detail: String },
 }

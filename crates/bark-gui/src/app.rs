@@ -51,6 +51,7 @@ const IDM_SETTINGS: u16 = 2302;
 const IDM_LOGS: u16 = 2303;
 const IDM_ABOUT: u16 = 2401;
 const IDM_REVOKE: u16 = 2501;
+const IDM_OPEN: u16 = 2601;
 
 /// Column headings, with widths at 96 DPI.
 const COLUMNS: [(&str, i32); 7] = [
@@ -64,6 +65,7 @@ const COLUMNS: [(&str, i32); 7] = [
 ];
 
 static MAIN: AtomicIsize = AtomicIsize::new(0);
+static TASKBAR_CREATED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 static QUEUE: Mutex<VecDeque<Event>> = Mutex::new(VecDeque::new());
 
 #[derive(Clone, Copy)]
@@ -126,6 +128,8 @@ thread_local! {
     static NODE: RefCell<Option<NodeHandle>> = const { RefCell::new(None) };
     static ACTIVE_DIALOG: Cell<Option<HWND>> = const { Cell::new(None) };
     static ACCEL: Cell<Option<HACCEL>> = const { Cell::new(None) };
+    static SMALL_ICON: Cell<HICON> = const { Cell::new(HICON(std::ptr::null_mut())) };
+    static HIDE_EXPLAINED: Cell<bool> = const { Cell::new(false) };
 }
 
 fn handles() -> Option<Handles> {
@@ -225,6 +229,14 @@ pub fn run(node: impl FnOnce(EventSink) -> NodeHandle, title_suffix: &str) -> i3
         let dpi = GetDpiForWindow(hwnd).max(96);
         create_children(hwnd, dpi);
 
+        let big = crate::tray::app_icon(px(32, dpi));
+        let small = crate::tray::app_icon(px(16, dpi));
+        SendMessageW(hwnd, WM_SETICON, Some(WPARAM(ICON_BIG as usize)), Some(LPARAM(big.0 as isize)));
+        SendMessageW(hwnd, WM_SETICON, Some(WPARAM(ICON_SMALL as usize)), Some(LPARAM(small.0 as isize)));
+        SMALL_ICON.with(|i| i.set(small));
+        TASKBAR_CREATED.store(crate::tray::taskbar_created_message(), Ordering::Relaxed);
+        crate::tray::add(hwnd, small, "BARK - starting");
+
         // Size the window for the screen it opened on, then show it.
         let _ = SetWindowPos(hwnd, None, 0, 0, px(860, dpi), px(540, dpi), SWP_NOMOVE | SWP_NOZORDER);
         MAIN.store(hwnd.0 as isize, Ordering::Release);
@@ -237,8 +249,10 @@ pub fn run(node: impl FnOnce(EventSink) -> NodeHandle, title_suffix: &str) -> i3
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            // The main window's shortcuts (Del removes a device!) must never
+            // fire while typing into a remote session.
             if let Some(a) = accel {
-                if TranslateAcceleratorW(hwnd, a, &msg) != 0 {
+                if !crate::session::is_session_window(msg.hwnd) && TranslateAcceleratorW(hwnd, a, &msg) != 0 {
                     continue;
                 }
             }
@@ -729,9 +743,20 @@ fn context_menu(h: &Handles) {
     }
 }
 
+/// Brings the main window back from the notification area.
+pub fn restore_main() {
+    let Some(h) = handles() else { return };
+    unsafe {
+        let _ = ShowWindow(h.main, SW_SHOW);
+        let _ = ShowWindow(h.main, SW_RESTORE);
+        let _ = SetForegroundWindow(h.main);
+    }
+}
+
 fn on_command(id: u16) {
     let Some(h) = handles() else { return };
     match id {
+        IDM_OPEN => restore_main(),
         IDM_ADD => dialogs::add_device(h.main),
         IDM_REMOVE => do_remove(),
         IDM_PROPS => do_properties(),
@@ -762,11 +787,43 @@ fn drain_events() {
     }
 }
 
+fn device_name(device: &Fingerprint) -> String {
+    STATE.with(|s| s.borrow().devices.iter().find(|x| x.fingerprint == *device).map(|d| d.name.clone()))
+        .unwrap_or_else(|| "the device".into())
+}
+
+fn take_viewer(session_id: u64) -> Option<bark_node::ViewerLink> {
+    NODE.with(|n| n.try_borrow().ok().and_then(|n| n.as_ref().and_then(|n| n.take_viewer(session_id))))
+}
+
 fn handle_event(e: Event) {
     let Some(h) = handles() else { return };
     match e {
+        Event::ConnectProgress { device, text } => {
+            set_status_message(&format!("{}: {text}", device_name(&device)));
+        }
+        Event::SessionOpened { session_id, device, name, path, remote_address, verification, connect_ms } => {
+            let name = if name.is_empty() { device_name(&device) } else { name };
+            set_status_message(&format!("Connected to {name} ({path}, {connect_ms} ms)."));
+            match take_viewer(session_id) {
+                Some(link) => crate::session::open(link, name, path, remote_address, verification, connect_ms),
+                None => error_box(Some(h.main), "The session opened but its window could not be attached."),
+            }
+        }
+        Event::SessionClosed { device, reason, .. } => {
+            set_status_message(&format!("Session with {} ended: {}", device_name(&device), reason.lines().next().unwrap_or_default()));
+        }
+        Event::HostSessionStarted { session_id, name, path, verification, .. } => {
+            set_status_message(&format!("{name} is controlling this computer. Verification words: {verification}"));
+            crate::banner::show(session_id, &name, &path);
+        }
+        Event::HostSessionEnded { session_id, device, .. } => {
+            crate::banner::close(session_id);
+            set_status_message(&format!("{} is no longer controlling this computer.", device_name(&device)));
+        }
         Event::Status(s) => {
             show_status(&s);
+            crate::tray::set_tip(h.main, &format!("BARK - {} ({}) - server {}", s.device_name, s.device_id, s.server.word()));
             STATE.with(|st| st.borrow_mut().status = Some(s));
         }
         Event::Devices(d) => {
@@ -913,11 +970,34 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 LRESULT(0)
             }
             WM_CLOSE => {
-                let _ = DestroyWindow(hwnd);
+                // Closing hides: this computer must stay reachable. Exit is
+                // in the File menu and on the notification-area icon.
+                let _ = ShowWindow(hwnd, SW_HIDE);
+                if !HIDE_EXPLAINED.with(|e| e.replace(true)) {
+                    crate::tray::balloon(
+                        hwnd,
+                        "BARK is still running",
+                        "This computer stays reachable. Double-click the BARK icon near the clock to open it, or right-click it to exit.",
+                    );
+                }
+                LRESULT(0)
+            }
+            crate::tray::WM_TRAY => {
+                match loword(lp.0 as usize) as u32 {
+                    WM_LBUTTONDBLCLK => restore_main(),
+                    WM_RBUTTONUP | WM_CONTEXTMENU => crate::tray::menu(hwnd, IDM_OPEN, IDM_EXIT),
+                    _ => {}
+                }
                 LRESULT(0)
             }
             WM_DESTROY => {
+                crate::tray::remove(hwnd);
                 PostQuitMessage(0);
+                LRESULT(0)
+            }
+            m if m != 0 && m == TASKBAR_CREATED.load(Ordering::Relaxed) => {
+                // Explorer restarted: put the icon back.
+                crate::tray::add(hwnd, SMALL_ICON.with(|i| i.get()), "BARK");
                 LRESULT(0)
             }
             _ => DefWindowProcW(hwnd, msg, wp, lp),

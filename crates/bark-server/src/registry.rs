@@ -117,7 +117,23 @@ struct State {
     watching: HashMap<Fingerprint, Vec<Fingerprint>>,
     /// Server-issued exchange id -> the exchange.
     exchanges: HashMap<u64, Exchange>,
+    /// Connections a target recently accepted, keyed by the requester and the
+    /// requester's own request id. A relay is only ever set up for one of
+    /// these.
+    accepted: HashMap<(Fingerprint, u64), AcceptedConnect>,
 }
+
+/// A connection the target said yes to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AcceptedConnect {
+    pub target: Fingerprint,
+    /// The identifier the target knows this connection by.
+    pub exchange_id: u64,
+    pub accepted_unix_us: u64,
+}
+
+/// How long after acceptance a relay may still be requested.
+pub const ACCEPTED_TIMEOUT_US: u64 = 60 * 1_000_000;
 
 /// Presence and routing for all connected nodes.
 pub struct Registry {
@@ -283,6 +299,24 @@ impl Registry {
     /// Rejects an answer from any device other than the one the offer was sent
     /// to, which is what stops a third device injecting itself into someone
     /// else's connection attempt.
+    /// Remembers that `target` accepted a connection, so a relay may be set
+    /// up for it.
+    pub fn note_accepted(&self, requester: Fingerprint, requester_request_id: u64, target: Fingerprint, exchange_id: u64) {
+        self.lock().accepted.insert(
+            (requester, requester_request_id),
+            AcceptedConnect { target, exchange_id, accepted_unix_us: bark_core::clock::unix_us() },
+        );
+    }
+
+    /// The accepted connection a requester is asking to relay, if it exists
+    /// and is recent. Consumed: one relay per accepted connection.
+    pub fn take_accepted(&self, requester: &Fingerprint, requester_request_id: u64) -> Option<AcceptedConnect> {
+        let now = bark_core::clock::unix_us();
+        let mut s = self.lock();
+        let found = s.accepted.remove(&(*requester, requester_request_id))?;
+        (now.saturating_sub(found.accepted_unix_us) <= ACCEPTED_TIMEOUT_US).then_some(found)
+    }
+
     pub fn close_exchange(
         &self,
         exchange_id: u64,
@@ -324,6 +358,7 @@ impl Registry {
                     expired.push((e.requester, e.requester_request_id, e.kind));
                 }
             }
+            s.accepted.retain(|_, a| now.saturating_sub(a.accepted_unix_us) <= ACCEPTED_TIMEOUT_US);
         }
 
         for (requester, request_id, kind) in &expired {

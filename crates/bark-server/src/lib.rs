@@ -18,6 +18,7 @@
 
 pub mod db;
 pub mod registry;
+pub mod relay;
 pub mod serve;
 pub mod session;
 

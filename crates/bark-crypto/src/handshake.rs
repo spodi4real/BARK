@@ -33,6 +33,15 @@
 //!   handshake cannot be replayed to produce the same keys.
 //! * **No trust in the relay.** The server never sees a private key and cannot
 //!   substitute its own: doing so would require forging a signature.
+//! * **Bound to the connection it runs on.** Both sides mix a *channel
+//!   binding* into the signed transcript: a value exported from the QUIC/TLS
+//!   connection carrying the handshake. Two endpoints of one genuine QUIC
+//!   connection export the same value; anything that terminated TLS in the
+//!   middle and ran two separate connections would export two different
+//!   values, and both signatures would fail. This is what lets session data
+//!   travel under QUIC's own encryption, with no second layer: once this
+//!   handshake succeeds, the QUIC connection itself is proven to run between
+//!   the two paired devices and nobody else.
 
 use crate::identity::{context, DeviceIdentity, PublicIdentity};
 use crate::session::SessionKeys;
@@ -73,9 +82,17 @@ pub struct Confirm {
 /// combination. If any byte of the exchange differs between the two peers —
 /// because something tampered with it in flight — the hashes differ, the
 /// signatures fail, and the handshake is abandoned.
-fn transcript(hello: &Hello, nonce_r: &[u8; 32], eph_r: &[u8; 32], id_r: &PublicIdentity) -> [u8; 32] {
+fn transcript(
+    channel: &[u8; 32],
+    hello: &Hello,
+    nonce_r: &[u8; 32],
+    eph_r: &[u8; 32],
+    id_r: &PublicIdentity,
+) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(b"BARK-v1/handshake-transcript");
+    // Never sent: each side computes it from its own end of the connection.
+    h.update(channel);
     h.update(hello.protocol.to_be_bytes());
     h.update(hello.nonce);
     h.update(hello.ephemeral);
@@ -136,11 +153,16 @@ pub struct Initiator {
     identity_public: PublicIdentity,
     hello: Hello,
     secret: StaticSecret,
+    channel: [u8; 32],
 }
 
 impl Initiator {
     /// Starts a handshake. Returns the message to send.
-    pub fn start(identity: &DeviceIdentity) -> Result<(Self, Hello)> {
+    ///
+    /// `channel` is the binding exported from the connection this handshake
+    /// travels on (see the module documentation). Tests and benchmarks that
+    /// have no connection pass any fixed value, the same on both sides.
+    pub fn start(identity: &DeviceIdentity, channel: &[u8; 32]) -> Result<(Self, Hello)> {
         let (secret, ephemeral) = new_dh_keypair()?;
         let hello = Hello {
             protocol: PROTOCOL_VERSION,
@@ -149,7 +171,12 @@ impl Initiator {
             identity: identity.public(),
         };
         Ok((
-            Initiator { identity_public: identity.public(), hello: hello.clone(), secret },
+            Initiator {
+                identity_public: identity.public(),
+                hello: hello.clone(),
+                secret,
+                channel: *channel,
+            },
             hello,
         ))
     }
@@ -182,7 +209,13 @@ impl Initiator {
             }
         }
 
-        let t = transcript(&self.hello, &accept.nonce, &accept.ephemeral, &accept.identity);
+        let t = transcript(
+            &self.channel,
+            &self.hello,
+            &accept.nonce,
+            &accept.ephemeral,
+            &accept.identity,
+        );
 
         // Verify before doing any key agreement, so an unauthenticated peer
         // cannot make us do work or influence derived material.
@@ -245,6 +278,7 @@ impl Responder {
     pub fn accept<F>(
         identity: &DeviceIdentity,
         hello: &Hello,
+        channel: &[u8; 32],
         authorise: F,
     ) -> Result<(Self, Accept)>
     where
@@ -262,7 +296,7 @@ impl Responder {
 
         let (secret, ephemeral) = new_dh_keypair()?;
         let nonce = random_32()?;
-        let t = transcript(hello, &nonce, &ephemeral, &identity.public());
+        let t = transcript(channel, hello, &nonce, &ephemeral, &identity.public());
 
         let their_eph = XPublicKey::from(hello.ephemeral);
         let shared = secret.diffie_hellman(&their_eph);
@@ -307,16 +341,45 @@ impl Responder {
 mod tests {
     use super::*;
 
+    /// Stands in for the value both ends of one QUIC connection would export.
+    const CH: [u8; 32] = [0x5a; 32];
+
     fn allow_any(_: &PublicIdentity) -> Result<()> {
         Ok(())
+    }
+
+    #[test]
+    fn a_handshake_carried_across_two_different_connections_fails() {
+        // A relay (or anything else) that terminated TLS itself and ran one
+        // connection to each peer: the two sides export different bindings.
+        // It may pass every message through untouched and still must fail.
+        let controller = DeviceIdentity::generate().unwrap();
+        let remote = DeviceIdentity::generate().unwrap();
+        let controller_side = [1u8; 32];
+        let remote_side = [2u8; 32];
+
+        let (init, hello) = Initiator::start(&controller, &controller_side).unwrap();
+        let (resp, accept) = Responder::accept(&remote, &hello, &remote_side, allow_any).unwrap();
+        assert!(
+            init.finish(&controller, &accept, Some(&remote.public())).is_err(),
+            "the controller must refuse an answer signed over another connection"
+        );
+
+        // And the other direction: even a confirm computed on the controller's
+        // connection must not satisfy the remote.
+        let (init, hello) = Initiator::start(&controller, &controller_side).unwrap();
+        let (resp2, accept2) = Responder::accept(&remote, &hello, &controller_side, allow_any).unwrap();
+        let (_, confirm) = init.finish(&controller, &accept2, None).unwrap();
+        drop(resp2);
+        assert!(resp.finish(&confirm).is_err(), "a confirm from another connection must fail");
     }
 
     fn run() -> (SessionKeys, SessionKeys, DeviceIdentity, DeviceIdentity) {
         let controller = DeviceIdentity::generate().unwrap();
         let remote = DeviceIdentity::generate().unwrap();
 
-        let (init, hello) = Initiator::start(&controller).unwrap();
-        let (resp, accept) = Responder::accept(&remote, &hello, allow_any).unwrap();
+        let (init, hello) = Initiator::start(&controller, &CH).unwrap();
+        let (resp, accept) = Responder::accept(&remote, &hello, &CH, allow_any).unwrap();
         let (ckeys, confirm) = init.finish(&controller, &accept, Some(&remote.public())).unwrap();
         let rkeys = resp.finish(&confirm).unwrap();
         (ckeys, rkeys, controller, remote)
@@ -353,9 +416,9 @@ mod tests {
     fn an_unpaired_device_is_refused_before_key_agreement() {
         let controller = DeviceIdentity::generate().unwrap();
         let remote = DeviceIdentity::generate().unwrap();
-        let (_, hello) = Initiator::start(&controller).unwrap();
+        let (_, hello) = Initiator::start(&controller, &CH).unwrap();
 
-        let err = Responder::accept(&remote, &hello, |_| {
+        let err = Responder::accept(&remote, &hello, &CH, |_| {
             Err(BarkError::NotTrusted("BA-TEST-TEST".into()))
         })
         .unwrap_err();
@@ -366,10 +429,10 @@ mod tests {
     fn the_authorisation_callback_sees_the_real_claiming_identity() {
         let controller = DeviceIdentity::generate().unwrap();
         let remote = DeviceIdentity::generate().unwrap();
-        let (_, hello) = Initiator::start(&controller).unwrap();
+        let (_, hello) = Initiator::start(&controller, &CH).unwrap();
 
         let mut seen = None;
-        let _ = Responder::accept(&remote, &hello, |id| {
+        let _ = Responder::accept(&remote, &hello, &CH, |id| {
             seen = Some(*id);
             Ok(())
         });
@@ -382,8 +445,8 @@ mod tests {
         let actual_remote = DeviceIdentity::generate().unwrap();
         let intended_remote = DeviceIdentity::generate().unwrap();
 
-        let (init, hello) = Initiator::start(&controller).unwrap();
-        let (_, accept) = Responder::accept(&actual_remote, &hello, allow_any).unwrap();
+        let (init, hello) = Initiator::start(&controller, &CH).unwrap();
+        let (_, accept) = Responder::accept(&actual_remote, &hello, &CH, allow_any).unwrap();
 
         // The server routed us somewhere else. We must notice.
         let err = init
@@ -396,8 +459,8 @@ mod tests {
     fn a_tampered_accept_signature_is_rejected() {
         let controller = DeviceIdentity::generate().unwrap();
         let remote = DeviceIdentity::generate().unwrap();
-        let (init, hello) = Initiator::start(&controller).unwrap();
-        let (_, mut accept) = Responder::accept(&remote, &hello, allow_any).unwrap();
+        let (init, hello) = Initiator::start(&controller, &CH).unwrap();
+        let (_, mut accept) = Responder::accept(&remote, &hello, &CH, allow_any).unwrap();
 
         accept.signature[0] ^= 0xff;
         assert!(init.finish(&controller, &accept, None).is_err());
@@ -407,8 +470,8 @@ mod tests {
     fn a_tampered_ephemeral_key_is_rejected() {
         let controller = DeviceIdentity::generate().unwrap();
         let remote = DeviceIdentity::generate().unwrap();
-        let (init, hello) = Initiator::start(&controller).unwrap();
-        let (_, mut accept) = Responder::accept(&remote, &hello, allow_any).unwrap();
+        let (init, hello) = Initiator::start(&controller, &CH).unwrap();
+        let (_, mut accept) = Responder::accept(&remote, &hello, &CH, allow_any).unwrap();
 
         // A relay in the middle swaps in its own key. The signature covers the
         // transcript, which covers the ephemeral, so this must fail.
@@ -423,8 +486,8 @@ mod tests {
     fn a_tampered_confirm_signature_is_rejected() {
         let controller = DeviceIdentity::generate().unwrap();
         let remote = DeviceIdentity::generate().unwrap();
-        let (init, hello) = Initiator::start(&controller).unwrap();
-        let (resp, accept) = Responder::accept(&remote, &hello, allow_any).unwrap();
+        let (init, hello) = Initiator::start(&controller, &CH).unwrap();
+        let (resp, accept) = Responder::accept(&remote, &hello, &CH, allow_any).unwrap();
         let (_, mut confirm) = init.finish(&controller, &accept, None).unwrap();
 
         confirm.signature[10] ^= 0x01;
@@ -438,12 +501,12 @@ mod tests {
         let controller = DeviceIdentity::generate().unwrap();
         let remote = DeviceIdentity::generate().unwrap();
 
-        let (init1, hello1) = Initiator::start(&controller).unwrap();
-        let (_, accept1) = Responder::accept(&remote, &hello1, allow_any).unwrap();
+        let (init1, hello1) = Initiator::start(&controller, &CH).unwrap();
+        let (_, accept1) = Responder::accept(&remote, &hello1, &CH, allow_any).unwrap();
         let (_, confirm1) = init1.finish(&controller, &accept1, None).unwrap();
 
-        let (_init2, hello2) = Initiator::start(&controller).unwrap();
-        let (resp2, _accept2) = Responder::accept(&remote, &hello2, allow_any).unwrap();
+        let (_init2, hello2) = Initiator::start(&controller, &CH).unwrap();
+        let (resp2, _accept2) = Responder::accept(&remote, &hello2, &CH, allow_any).unwrap();
 
         assert!(
             resp2.finish(&confirm1).is_err(),
@@ -455,10 +518,10 @@ mod tests {
     fn a_protocol_version_mismatch_is_reported_clearly() {
         let controller = DeviceIdentity::generate().unwrap();
         let remote = DeviceIdentity::generate().unwrap();
-        let (_, mut hello) = Initiator::start(&controller).unwrap();
+        let (_, mut hello) = Initiator::start(&controller, &CH).unwrap();
         hello.protocol = PROTOCOL_VERSION + 1;
 
-        let err = Responder::accept(&remote, &hello, allow_any).unwrap_err();
+        let err = Responder::accept(&remote, &hello, &CH, allow_any).unwrap_err();
         let text = format!("{err}");
         assert!(text.contains("different version"), "got {text}");
         assert!(text.contains("Update"), "the message should say what to do: {text}");
@@ -470,10 +533,10 @@ mod tests {
         // shared secret.
         let controller = DeviceIdentity::generate().unwrap();
         let remote = DeviceIdentity::generate().unwrap();
-        let (_, mut hello) = Initiator::start(&controller).unwrap();
+        let (_, mut hello) = Initiator::start(&controller, &CH).unwrap();
         hello.ephemeral = [0u8; 32];
 
-        let err = Responder::accept(&remote, &hello, allow_any).unwrap_err();
+        let err = Responder::accept(&remote, &hello, &CH, allow_any).unwrap_err();
         assert!(format!("{err}").contains("invalid key"), "got {err}");
     }
 
@@ -481,8 +544,8 @@ mod tests {
     fn the_responder_reports_who_connected() {
         let controller = DeviceIdentity::generate().unwrap();
         let remote = DeviceIdentity::generate().unwrap();
-        let (_, hello) = Initiator::start(&controller).unwrap();
-        let (resp, _) = Responder::accept(&remote, &hello, allow_any).unwrap();
+        let (_, hello) = Initiator::start(&controller, &CH).unwrap();
+        let (resp, _) = Responder::accept(&remote, &hello, &CH, allow_any).unwrap();
         assert_eq!(resp.peer().fingerprint(), controller.public().fingerprint());
     }
 }

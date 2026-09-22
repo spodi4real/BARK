@@ -12,7 +12,10 @@
 #![windows_subsystem = "windows"]
 
 mod app;
+mod banner;
 mod dialogs;
+mod session;
+mod tray;
 mod win;
 
 use bark_node::NodeDirs;
@@ -74,6 +77,8 @@ fn single_instance(profile: &str) -> bool {
         if handle.is_ok() && GetLastError() == ERROR_ALREADY_EXISTS {
             let class = win::Wide::new("BARK.MainWindow");
             if let Ok(existing) = FindWindowW(class.pcwstr(), windows::core::PCWSTR::null()) {
+                // It may be hidden in the notification area.
+                let _ = ShowWindow(existing, windows::Win32::UI::WindowsAndMessaging::SW_SHOW);
                 let _ = ShowWindow(existing, SW_RESTORE);
                 let _ = SetForegroundWindow(existing);
             }

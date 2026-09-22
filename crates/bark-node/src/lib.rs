@@ -11,8 +11,13 @@
 
 pub mod api;
 pub mod config;
+#[cfg(windows)]
+pub mod host;
 pub mod runtime;
+pub mod session;
+pub mod viewer;
 
 pub use api::{Command, DeviceView, Event, NodeStatus, ServerLink};
 pub use config::{NodeConfig, NodeDirs, Roles, ServerTarget};
 pub use runtime::{start, EventSink, NodeHandle};
+pub use viewer::{SessionStats, ViewerCommand, ViewerEvent, ViewerLink};

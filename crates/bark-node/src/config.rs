@@ -166,6 +166,10 @@ pub struct NodeConfig {
     pub accept_incoming: bool,
     #[serde(default = "default_true")]
     pub clipboard_sync: bool,
+    /// Skip direct connection attempts and always use the relay. For testing
+    /// the relay path; set by editing config.json, not shown in Settings.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub force_relay: bool,
 }
 
 impl Default for NodeConfig {
@@ -176,6 +180,7 @@ impl Default for NodeConfig {
             roles: Roles::default(),
             accept_incoming: true,
             clipboard_sync: true,
+            force_relay: false,
         }
     }
 }

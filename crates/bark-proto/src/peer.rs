@@ -6,8 +6,91 @@
 //! clipboard data cannot delay a frame — QUIC streams are independent, which is
 //! the specific property that makes this work and that TCP cannot provide.
 
+use crate::control::FailureReason;
 use crate::video::Codec;
+use bark_crypto::{handshake, PublicIdentity, Signature64};
 use serde::{Deserialize, Serialize};
+
+/// The first messages on a new peer connection: the session handshake.
+///
+/// They travel on the first stream the controller opens. **Nothing else is
+/// read from or written to the connection until `Confirm` has been verified**
+/// — the transport under these messages is encrypted but not yet
+/// authenticated (see `bark_net::tls::TransportOnlyVerifier`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum Setup {
+    Hello {
+        protocol: u16,
+        nonce: [u8; 32],
+        ephemeral: [u8; 32],
+        identity: PublicIdentity,
+    },
+    Accept {
+        nonce: [u8; 32],
+        ephemeral: [u8; 32],
+        identity: PublicIdentity,
+        signature: Signature64,
+    },
+    Confirm {
+        signature: Signature64,
+    },
+    /// The remote will not open a session. Sent instead of `Accept`, so the
+    /// controller can show why rather than "connection lost".
+    Refused {
+        reason: FailureReason,
+        detail: String,
+    },
+}
+
+impl From<handshake::Hello> for Setup {
+    fn from(h: handshake::Hello) -> Self {
+        Setup::Hello { protocol: h.protocol, nonce: h.nonce, ephemeral: h.ephemeral, identity: h.identity }
+    }
+}
+
+impl From<handshake::Accept> for Setup {
+    fn from(a: handshake::Accept) -> Self {
+        Setup::Accept {
+            nonce: a.nonce,
+            ephemeral: a.ephemeral,
+            identity: a.identity,
+            signature: a.signature.into(),
+        }
+    }
+}
+
+impl From<handshake::Confirm> for Setup {
+    fn from(c: handshake::Confirm) -> Self {
+        Setup::Confirm { signature: c.signature.into() }
+    }
+}
+
+impl Setup {
+    pub fn into_hello(self) -> Option<handshake::Hello> {
+        match self {
+            Setup::Hello { protocol, nonce, ephemeral, identity } => {
+                Some(handshake::Hello { protocol, nonce, ephemeral, identity })
+            }
+            _ => None,
+        }
+    }
+
+    pub fn into_accept(self) -> Option<handshake::Accept> {
+        match self {
+            Setup::Accept { nonce, ephemeral, identity, signature } => {
+                Some(handshake::Accept { nonce, ephemeral, identity, signature: signature.0 })
+            }
+            _ => None,
+        }
+    }
+
+    pub fn into_confirm(self) -> Option<handshake::Confirm> {
+        match self {
+            Setup::Confirm { signature } => Some(handshake::Confirm { signature: signature.0 }),
+            _ => None,
+        }
+    }
+}
 
 /// Stream identifiers, used as the first byte of each opened stream so the
 /// receiver knows what it is.
@@ -251,6 +334,11 @@ pub enum ToController {
         hotspot_y: u16,
         /// BGRA, top row first.
         pixels: Vec<u8>,
+        /// How to read the alpha byte. `false`: ordinary transparency.
+        /// `true`: Windows "masked" semantics, needed for cursors that invert
+        /// what is under them (the text I-beam): alpha 0xFF means "draw this
+        /// colour", alpha 0 means "XOR this colour with the screen".
+        xor: bool,
         /// The cursor is hidden entirely.
         hidden: bool,
     },
@@ -306,6 +394,27 @@ mod tests {
             secure_desktop: true,
             audio: false,
         }
+    }
+
+    #[test]
+    fn a_whole_handshake_survives_the_wire() {
+        let controller = bark_crypto::DeviceIdentity::generate().unwrap();
+        let remote = bark_crypto::DeviceIdentity::generate().unwrap();
+        let ch = [9u8; 32];
+
+        fn wire(s: Setup) -> Setup {
+            let bytes = encode_framed(&s).unwrap();
+            decode_framed::<Setup>(&bytes).unwrap().unwrap().0
+        }
+
+        let (init, hello) = handshake::Initiator::start(&controller, &ch).unwrap();
+        let hello = wire(hello.into()).into_hello().expect("a hello");
+        let (resp, accept) = handshake::Responder::accept(&remote, &hello, &ch, |_| Ok(())).unwrap();
+        let accept = wire(accept.into()).into_accept().expect("an accept");
+        let (ck, confirm) = init.finish(&controller, &accept, Some(&remote.public())).unwrap();
+        let confirm = wire(confirm.into()).into_confirm().expect("a confirm");
+        let rk = resp.finish(&confirm).unwrap();
+        assert_eq!(ck.binding(), rk.binding());
     }
 
     #[test]
@@ -405,6 +514,7 @@ mod tests {
                 hotspot_x: 0,
                 hotspot_y: 0,
                 pixels: vec![0u8; 32 * 32 * 4],
+                xor: false,
                 hidden: false,
             },
             ToController::Stats {

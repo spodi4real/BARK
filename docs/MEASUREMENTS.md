@@ -197,30 +197,113 @@ networking layer exists.
 
 ---
 
+## Build day, 2026-09-22 — sessions, relay, video pipeline
+
+Same reference machine. Display: 1920x1080 on the Intel UHD Graphics (the
+laptop panel is driven by the integrated GPU). Everything below ran on this
+one laptop; **nothing has crossed a real network yet.**
+
+### Session setup (loopback)
+
+| Measurement | Result | Source |
+|---|---|---|
+| QUIC connect + channel-bound SIGMA handshake | **9.7 - 11.2 ms** | `bark-net` peer test |
+| Same, through the real relay | **10.1 ms** (11.8 KB relayed) | `bark-server` relay_path test |
+| Node Connect to authenticated session, direct | **8 - 9 ms** | `bark-node` sessions test |
+| Node Connect to authenticated session, relayed (force_relay) | **9 - 12 ms** | `bark-node` sessions test |
+
+Loopback hides the network entirely; these numbers say only that BARK adds a
+few milliseconds of its own. Real session setup will be dominated by the
+network round trips (about 4 of them).
+
+### Video pipeline, real hardware (`bark-media` pipeline test, 120 frames)
+
+| Stage | Result |
+|---|---|
+| Encoder chosen | Intel Quick Sync Video H.264 Encoder MFT (hardware), all latency settings accepted |
+| Convert (GPU, BGRA to NV12) | 0.55 - 0.9 ms CPU time to submit |
+| Convert + encode, **before** the timer fix | median **28.6 - 31.2 ms**, p95 35 ms |
+| Convert + encode, **after** the timer fix | median **8.0 ms**, p95 9.2 - 10.0 ms |
+| of which: encoder busy (hand-over to bitstream back) | **4 - 6 ms** |
+| of which: waiting for the encoder to ask for input | ~1 ms (artefact of the back-to-back test loop) |
+| Keyframe size, 1080p desktop | 121 - 127 KB |
+| Decode (GPU, DXVA) + convert back | median **1.36 - 1.45 ms**, p95 1.9 ms |
+| First frame decodes immediately (low-latency decoder) | yes, frame #0 |
+
+**The timer fix.** Instrumenting the encoder showed every frame waiting two
+~15 ms stretches: exactly the default Windows timer tick (15.6 ms). The Intel
+driver's worker threads sleep while polling the hardware, and a sleep lasts
+at least one tick. Requesting 1 ms timer resolution (`timeBeginPeriod(1)`),
+and opting out of Windows 11's habit of ignoring that request for processes
+whose windows are hidden (`PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION`),
+cut the time by 3.6x. The encoder's own "fastest" speed setting made no
+measurable difference, so ~5 ms is this encoder's floor at 1080p.
+
+Target from the architecture was capture-to-bitstream under 3 ms. **Not met on
+this machine's integrated GPU.** Untried: the RTX 3050's NVENC, which cannot be
+fed directly because the display is on the Intel GPU (needs a cross-adapter
+copy).
+
+### Live session in the real GUI (two BARK windows on this laptop)
+
+The remote screen is this same screen, so the picture is an infinite mirror
+that changes every frame: a worst case for pacing.
+
+| Figure (from the session window's status bar) | Before pacing fix | After |
+|---|---|---|
+| Frame rate | 40 fps | **55 fps** |
+| Remote: screen present to send | 26 ms (included idle waiting — measurement bug) | **11.3 ms** |
+| Decode + present | 2.0 ms | 2.4 ms |
+| Round trip (QUIC estimator, loopback) | 1.1 ms | 1.1 ms |
+| Bitrate | 6.7 Mbit/s | 9.3 Mbit/s |
+
+Pacing bug: the next frame slot was measured from the end of encoding, so the
+frame interval was 16.7 ms plus the encode time. Timestamp bug: capture time
+was taken before waiting for a frame. "Remote" now starts at DXGI's own
+record of when the frame reached the screen (`LastPresentTime`). In this
+mirror test most of the remaining 11 ms is a frame waiting for its 60 fps
+slot plus ~5 ms of encoding; ordinary use (typing) changes the screen less
+often, so the slot is usually open.
+
+**Input-to-frame latency** (the headline number) is measured and displayed by
+the session window, but cannot be exercised on one machine: a controller on
+the same computer would move the mouse under its own window, so BARK does not
+apply input on a loopback session. It is the first thing to read on the
+second machine.
+
+### Socket buffers
+
+| | Receive buffer |
+|---|---|
+| Windows default for a UDP socket | **65,536 bytes** |
+| BARK session sockets now | **8,388,608 bytes** |
+
+Found by an intermittently failing test: a 121 KB keyframe arriving as one
+burst overflowed the 64 KB default when the machine was busy, the keyframe
+could not be reassembled, and the next frame arrived first. The same would
+happen on a real network. After the change: 6 consecutive full test runs,
+291/291.
+
+---
+
 ## What is NOT yet measured
 
 Stated plainly so this document is not mistaken for more than it is:
 
-* **Screen capture latency** — no capture code exists yet.
-* **Encode latency** — no encoder exists yet. NVENC and QuickSync are both
-  present on this machine but neither has been touched.
-* **Real-network RTT, loss and jitter** — only loopback has been measured.
-* **NAT traversal** — hole punching is designed but not written, so its success
-  rate on real networks is unknown. This is the single biggest open question in
-  the project: if it fails often, sessions fall back to the relay and latency
-  rises by a whole extra hop.
-* **Relay fallback** — not written. The server answers a relay request with an
-  explicit "relay unavailable" rather than leaving the node waiting.
-* **A second physical computer** — every server test so far ran on this laptop.
-  Nothing has yet crossed a real network cable or Wi-Fi link.
-* **Congestion control under loss** — BBR is configured on reasoning, not on
-  measurement. It has never been compared against Cubic on a real link.
-* **Decode and render latency** — not built.
-* **True input-to-photon latency** — the number that actually matters, and the
-  one that can only be measured when every stage above exists.
-* **`harden_directory`** — the ACL lockdown on `C:\ProgramData\BARK` is written
-  but not yet exercised, because it needs Administrator rights and a real
-  install. It will be verified during installer testing.
+* **A second physical computer.** Every number in this document comes from
+  one laptop. Nothing has crossed a real network cable or Wi-Fi link.
+* **Input-to-frame latency** — built, displayed, not yet observed (see above).
+* **NAT traversal on real networks** — hole punching is built and tested on
+  loopback only. Its success rate across real NATs is the biggest unknown.
+  Note: with the BARK server inside the office, it sees office machines by
+  their LAN addresses, so sessions from outside the office will use the relay
+  (a server on the public internet is needed for hole punching across NATs).
+* **Relay over a real network**, including through a port-forwarded router.
+* **Congestion control under loss** — BBR is still configured on reasoning.
+* **NVENC** on the RTX 3050.
+* **Frame pacing on the controller** (present timing against the display's
+  refresh) — frames are presented the moment they decode; not yet measured.
+* **`harden_directory`** — needs Administrator rights and a real install.
 
 The foundation being fast says nothing about whether BARK will feel fast. It
 says the foundation will not be the reason it does not.

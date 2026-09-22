@@ -66,6 +66,7 @@ impl TestServer {
             registry: Arc::new(Registry::new()),
             cert_fingerprint: fingerprint,
             version: bark_core::VERSION.to_string(),
+            relay: None,
         });
 
         let tasks = bark_server::serve::spawn(state.clone(), endpoint);

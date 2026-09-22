@@ -19,9 +19,10 @@ pub mod control;
 pub mod endpoint;
 pub mod framing;
 pub mod interfaces;
+pub mod peer;
 pub mod tls;
 
 pub use control::{ControlConnection, PresenceTable, ServerGreeting};
-pub use endpoint::{bidirectional_endpoint, client_only_endpoint, connect, local_address, Role};
+pub use endpoint::{bidirectional_endpoint, client_only_endpoint, connect, local_address, NodeSocket, Role};
 pub use framing::{read_expected, read_message, write_message};
 pub use tls::{parse_fingerprint, TransportCredentials};

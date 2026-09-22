@@ -474,14 +474,14 @@ fn measure_handshake(r: &mut Report) {
     let mut ok = true;
     for _ in 0..50 {
         let t0 = clock::now_ns();
-        let (init, hello) = match Initiator::start(&controller) {
+        let (init, hello) = match Initiator::start(&controller, &[0u8; 32]) {
             Ok(v) => v,
             Err(_) => {
                 ok = false;
                 break;
             }
         };
-        let (resp, accept) = match Responder::accept(&remote, &hello, |_| Ok(())) {
+        let (resp, accept) = match Responder::accept(&remote, &hello, &[0u8; 32], |_| Ok(())) {
             Ok(v) => v,
             Err(_) => {
                 ok = false;
@@ -525,8 +525,8 @@ fn measure_handshake(r: &mut Report) {
     );
 
     // Verification words let two people confirm no one is in the middle.
-    let (init, hello) = Initiator::start(&controller).expect("start");
-    let (resp, accept) = Responder::accept(&remote, &hello, |_| Ok(())).expect("accept");
+    let (init, hello) = Initiator::start(&controller, &[0u8; 32]).expect("start");
+    let (resp, accept) = Responder::accept(&remote, &hello, &[0u8; 32], |_| Ok(())).expect("accept");
     let (ck, confirm) = init.finish(&controller, &accept, None).expect("finish");
     let rk = resp.finish(&confirm).expect("finish");
     r.check(
@@ -543,8 +543,8 @@ fn measure_encryption(r: &mut Report) {
 
     let controller = DeviceIdentity::generate().expect("generate");
     let remote = DeviceIdentity::generate().expect("generate");
-    let (init, hello) = Initiator::start(&controller).expect("start");
-    let (resp, accept) = Responder::accept(&remote, &hello, |_| Ok(())).expect("accept");
+    let (init, hello) = Initiator::start(&controller, &[0u8; 32]).expect("start");
+    let (resp, accept) = Responder::accept(&remote, &hello, &[0u8; 32], |_| Ok(())).expect("accept");
     let (ck, confirm) = init.finish(&controller, &accept, None).expect("finish");
     let rk = resp.finish(&confirm).expect("finish");
 

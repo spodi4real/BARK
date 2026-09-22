@@ -28,6 +28,9 @@ pub enum Command {
     SetDetails { device: Fingerprint, description: String, group: String },
     /// Replace the settings. Validated first; applied by reconnecting.
     SetConfig(NodeConfig),
+    /// The person at this computer ends a session someone else is running
+    /// on it.
+    EndHostSession { session_id: u64 },
     Shutdown,
 }
 
@@ -73,6 +76,21 @@ pub struct ServerRoleStatus {
     pub key_text: String,
     pub devices_online: usize,
     pub devices_known: u64,
+    /// Where the relay listens, when this server relays.
+    pub relay: Option<String>,
+}
+
+/// A running session, for diagnostics.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionView {
+    pub session_id: u64,
+    pub device_name: String,
+    /// This computer is controlling the other one (rather than being controlled).
+    pub controlling: bool,
+    /// "DIRECT (LAN)", "DIRECT (internet)" or "RELAYED".
+    pub path: String,
+    pub remote_address: String,
+    pub started_unix_us: u64,
 }
 
 /// Everything about this computer the interface shows.
@@ -89,6 +107,8 @@ pub struct NodeStatus {
     pub config: NodeConfig,
     /// This computer's usable IPv4 addresses, best first.
     pub local_addresses: Vec<String>,
+    /// Sessions running now, in both directions.
+    pub sessions: Vec<SessionView>,
 }
 
 /// One remembered device, as the favourites list shows it.
@@ -138,7 +158,37 @@ pub enum Event {
     PairFinished { ok: bool, message: String, device: Option<DeviceView> },
     /// Another computer paired with this one using the code on screen.
     PairedBy { device: DeviceView },
+    /// A `Connect` failed. (Success arrives as `SessionOpened`.)
     ConnectFinished { device: Fingerprint, ok: bool, message: String },
+    /// What a `Connect` is doing now, for the connecting dialog.
+    ConnectProgress { device: Fingerprint, text: String },
+    /// A session this computer controls is open. The window showing it
+    /// collects its video and input channels with `NodeHandle::take_viewer`.
+    SessionOpened {
+        session_id: u64,
+        device: Fingerprint,
+        name: String,
+        /// "DIRECT (LAN)", "DIRECT (internet)" or "RELAYED".
+        path: String,
+        remote_address: String,
+        /// Words both computers show; matching words prove nothing is in the middle.
+        verification: String,
+        /// Time from pressing Connect to an authenticated session.
+        connect_ms: u32,
+    },
+    /// A session this computer controlled has ended.
+    SessionClosed { session_id: u64, device: Fingerprint, reason: String },
+    /// Another computer has started controlling this one. Shown prominently:
+    /// nobody is ever controlled without being able to see it.
+    HostSessionStarted {
+        session_id: u64,
+        device: Fingerprint,
+        name: String,
+        path: String,
+        /// The same words the controller sees; matching proves nothing is in the middle.
+        verification: String,
+    },
+    HostSessionEnded { session_id: u64, device: Fingerprint, reason: String },
     Notice { level: NoticeLevel, text: String },
     /// The node could not start. The text explains why and what to do.
     Fatal(String),

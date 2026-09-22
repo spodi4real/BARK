@@ -145,7 +145,10 @@ name = "bark-gui"
 version = "0.1.0"
 dependencies = [
  "bark-core",
+ "bark-media",
  "bark-node",
+ "bark-proto",
+ "tokio",
  "tracing",
  "windows",
 ]
@@ -153,10 +156,20 @@ dependencies = [
 [[package]]
 name = "bark-input"
 version = "0.1.0"
+dependencies = [
+ "bark-proto",
+ "tracing",
+ "windows",
+]
 
 [[package]]
 name = "bark-media"
 version = "0.1.0"
+dependencies = [
+ "bark-core",
+ "tracing",
+ "windows",
+]
 
 [[package]]
 name = "bark-net"
@@ -185,15 +198,19 @@ version = "0.1.0"
 dependencies = [
  "bark-core",
  "bark-crypto",
+ "bark-input",
+ "bark-media",
  "bark-net",
  "bark-proto",
  "bark-server",
+ "bytes",
  "quinn",
  "serde",
  "serde_json",
  "time",
  "tokio",
  "tracing",
+ "windows",
 ]
 
 [[package]]
@@ -214,6 +231,7 @@ dependencies = [
  "bark-crypto",
  "bark-net",
  "bark-proto",
+ "bytes",
  "getrandom 0.3.4",
  "hex",
  "quinn",

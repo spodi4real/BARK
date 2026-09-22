@@ -16,6 +16,7 @@
 pub mod control;
 pub mod input;
 pub mod peer;
+pub mod relay;
 pub mod video;
 pub mod wire;
 

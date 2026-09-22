@@ -84,6 +84,17 @@ pub fn now_us() -> u64 {
     secs * 1_000_000 + (rem * 1_000_000) / freq
 }
 
+/// Converts a raw performance-counter reading taken elsewhere in Windows (a
+/// DXGI present time, for instance) onto the `now_us` timeline. Readings from
+/// before this process started come out as zero.
+pub fn qpc_to_us(counter: u64) -> u64 {
+    let (freq, epoch) = ensure_init();
+    let delta = counter.saturating_sub(epoch);
+    let secs = delta / freq;
+    let rem = delta % freq;
+    secs * 1_000_000 + (rem * 1_000_000) / freq
+}
+
 /// Nanoseconds since process start, for measuring things too fast for
 /// microsecond resolution (a single memcpy, a lock acquisition).
 #[inline]

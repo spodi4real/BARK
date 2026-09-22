@@ -48,6 +48,8 @@ pub struct ServerState {
     /// The server's own TLS certificate fingerprint, mixed into the challenge.
     pub cert_fingerprint: [u8; 32],
     pub version: String,
+    /// The relay, when this server provides one.
+    pub relay: Option<Arc<crate::relay::Relay>>,
 }
 
 impl std::fmt::Debug for ServerState {
@@ -411,6 +413,9 @@ async fn handle_request(ctx: &NodeContext, msg: ToServer) -> Result<bool> {
         ToServer::ConnectAnswer { request_id, accept, reason, candidates } => {
             match reg.close_exchange(request_id, &me) {
                 Ok(route) => {
+                    if accept {
+                        reg.note_accepted(route.requester, route.requester_request_id, me, request_id);
+                    }
                     let peer = Some(ctx.identity);
                     push(
                         reg,
@@ -518,23 +523,46 @@ async fn handle_request(ctx: &NodeContext, msg: ToServer) -> Result<bool> {
         }
 
         ToServer::RelayRequest { request_id } => {
-            // Relay is not implemented yet. Saying so plainly is better than
-            // leaving the node waiting for an answer that never comes.
-            push(
-                reg,
-                &me,
-                ToNode::ConnectResult {
-                    request_id,
-                    accepted: false,
-                    reason: Some(FailureReason::RelayUnavailable),
-                    candidates: Vec::new(),
-                    peer: None,
-                },
-            );
+            handle_relay_request(ctx, request_id);
         }
     }
 
     Ok(false)
+}
+
+/// Sets up a relayed path for a connection the target has accepted.
+///
+/// Refused, with `RelayUnavailable`, unless: this server runs a relay, the
+/// requester is asking about a connection its target accepted within the last
+/// minute (so a relay can never be obtained for a pair that was not
+/// introduced), and the target is still online.
+fn handle_relay_request(ctx: &NodeContext, request_id: u64) {
+    let me = ctx.identity.fingerprint();
+    let reg = &ctx.state.registry;
+    let unavailable = |detail: &str| {
+        tracing::info!(requester = %me.short_id(), "relay refused: {detail}");
+        push(reg, &me, ToNode::RelayUnavailable { request_id, detail: detail.to_string() });
+    };
+
+    let Some(relay) = &ctx.state.relay else {
+        return unavailable("This BARK server does not provide relaying. Enable it in Tools > Settings on the server computer.");
+    };
+    let Some(accepted) = reg.take_accepted(&me, request_id) else {
+        return unavailable("The connection this relay was requested for is unknown or too old. Connect again.");
+    };
+    if !reg.is_online(&accepted.target) {
+        return unavailable("The remote computer went offline.");
+    }
+    let (controller_token, remote_token) = match relay.allocate(me, accepted.target) {
+        Ok(t) => t,
+        Err(e) => return unavailable(&e.to_string()),
+    };
+    let relay_address = relay.listening();
+    push(reg, &accepted.target, ToNode::RelayReady { request_id: accepted.exchange_id, relay_address, token: remote_token });
+    push(reg, &me, ToNode::RelayReady { request_id, relay_address, token: controller_token });
+    let _ = ctx.state.db.audit(
+        &AuditEntry::new("relay", true).actor(me).target(accepted.target).detail(format!("via {relay_address}")),
+    );
 }
 
 /// Common checks before forwarding an introduction to a target.

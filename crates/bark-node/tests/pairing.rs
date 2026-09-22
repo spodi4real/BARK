@@ -187,10 +187,13 @@ fn pairing_with_the_code_on_screen_works_and_is_directional() {
         _ => unreachable!(),
     }
 
-    // The introduction path works in the permitted direction...
+    // A session opens in the permitted direction...
     n.client_node.send(Command::Connect { device: n.server_status.fingerprint });
-    match n.client_events.wait(Duration::from_secs(10), |e| matches!(e, Event::ConnectFinished { .. })) {
-        Event::ConnectFinished { ok, message, .. } => assert!(ok, "should be accepted: {message}"),
+    match n.client_events.wait(Duration::from_secs(15), |e| {
+        matches!(e, Event::ConnectFinished { .. } | Event::SessionOpened { .. })
+    }) {
+        Event::SessionOpened { .. } => {}
+        Event::ConnectFinished { message, .. } => panic!("should be accepted: {message}"),
         _ => unreachable!(),
     }
 
@@ -329,8 +332,11 @@ fn pairing_survives_restarting_both_nodes() {
         matches!(e, Event::Devices(d) if d.iter().any(|x| x.name == "CENTRAL-SERVER" && x.online && x.we_may_control))
     });
     cn2.send(Command::Connect { device: ss2.fingerprint });
-    match ce2.wait(Duration::from_secs(10), |e| matches!(e, Event::ConnectFinished { .. })) {
-        Event::ConnectFinished { ok, message, .. } => assert!(ok, "still trusted after restart: {message}"),
+    match ce2.wait(Duration::from_secs(15), |e| {
+        matches!(e, Event::ConnectFinished { .. } | Event::SessionOpened { .. })
+    }) {
+        Event::SessionOpened { .. } => {}
+        Event::ConnectFinished { message, .. } => panic!("still trusted after restart: {message}"),
         _ => unreachable!(),
     }
 

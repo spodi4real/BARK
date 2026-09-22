@@ -148,11 +148,17 @@ async fn run(options: Options) -> Result<()> {
     )?;
     let listening = local_address(&endpoint)?;
 
+    // The relay listens on the next port up, on the same address.
+    let relay_bind = std::net::SocketAddr::new(options.bind.ip(), listening.port().wrapping_add(1));
+    let relay = bark_server::relay::Relay::bind(relay_bind, Default::default()).await?;
+    tokio::spawn(relay.clone().run());
+
     let state = Arc::new(ServerState {
         db: db.clone(),
         registry: registry.clone(),
         cert_fingerprint: credentials.fingerprint(),
         version: bark_core::VERSION.to_string(),
+        relay: Some(relay.clone()),
     });
 
     bark_server::serve::note_start(&state, listening)?;
@@ -160,6 +166,7 @@ async fn run(options: Options) -> Result<()> {
     println!();
     println!("BARK Coordination Server {} is running.", bark_core::VERSION);
     println!("  Listening on   {listening}");
+    println!("  Relay          {} (UDP)", relay.listening());
     println!("  Data folder    {}", options.data_dir.display());
     println!("  Devices known  {}", db.device_count()?);
     println!();

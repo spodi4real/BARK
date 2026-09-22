@@ -7,3 +7,13 @@ license.workspace = true
 publish = false
 
 [dependencies]
+bark-proto = { workspace = true }
+tracing = "0.1.44"
+
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.62.2"
+features = [
+    "Win32_Foundation",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+]

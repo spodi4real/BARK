@@ -1,0 +1,7 @@
+# BARK.exe must run on any Windows 10/11 PC as a single file. Without this the
+# Rust MSVC toolchain links the C runtime dynamically, and BARK.exe would refuse
+# to start on a PC that lacks the Visual C++ Redistributable
+# ("VCRUNTIME140.dll was not found"). Linking it statically removes that
+# dependency; everything else BARK uses ships with Windows.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

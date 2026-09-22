@@ -38,4 +38,5 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 
 [dev-dependencies]
+bytes = "1.12.1"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "net", "time", "sync", "macros", "test-util"] }

@@ -12,6 +12,9 @@ bark-crypto = { workspace = true }
 bark-net = { workspace = true }
 bark-proto = { workspace = true }
 bark-server = { path = "../bark-server" }
+bark-media = { workspace = true }
+bark-input = { workspace = true }
+bytes = "1.12.1"
 
 quinn = { version = "0.11.9", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 serde = { version = "1.0.229", features = ["derive"] }
@@ -19,6 +22,10 @@ serde_json = "1.0.151"
 time = { version = "0.3.44", features = ["local-offset"] }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "net", "time", "sync", "macros"] }
 tracing = "0.1.44"
+
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.62.2"
+features = ["Win32_Graphics_Direct3D11", "Win32_Graphics_Dxgi_Common"]
 
 [dev-dependencies]
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "net", "time", "sync", "macros", "test-util"] }

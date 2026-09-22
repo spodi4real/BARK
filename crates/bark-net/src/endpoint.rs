@@ -85,6 +85,14 @@ fn transport_config(role: Role) -> TransportConfig {
             tc.max_concurrent_bidi_streams(16u32.into());
             tc.max_concurrent_uni_streams(16u32.into());
 
+            // Only matters before the first round trip has been measured: it
+            // sets how soon a lost first packet is resent. QUIC's default
+            // (333 ms, so about a second before the first resend) suits the
+            // open internet; a hole-punched path whose first packet can be
+            // dropped by a NAT that has not opened yet connects noticeably
+            // faster with a shorter guess. Chosen, not measured.
+            tc.initial_rtt(Duration::from_millis(100));
+
             // Video rides in datagrams. This buffer is what absorbs a burst
             // while the decode thread is busy; too small drops frames that had
             // already arrived, too large just wastes memory since stale frames
@@ -142,6 +150,134 @@ pub fn bidirectional_endpoint(
     endpoint.set_default_client_config(client_config);
 
     Ok(endpoint)
+}
+
+/// Socket buffer sizes for anything carrying a session.
+///
+/// A keyframe is a burst of well over 100 KB arriving in a few milliseconds.
+/// Windows' default UDP receive buffer is far smaller, so on a busy computer
+/// part of the burst was dropped before BARK could read it — found by an
+/// intermittently failing test, and the same thing would happen on a real
+/// network. The sizes are generous next to one second of video at the
+/// highest bitrate BARK uses.
+pub const RECV_BUFFER: usize = 8 * 1024 * 1024;
+pub const SEND_BUFFER: usize = 4 * 1024 * 1024;
+
+/// Applies [`RECV_BUFFER`] and [`SEND_BUFFER`]. Windows may grant less; what
+/// it granted is logged.
+pub fn size_buffers<S: socket2_ref::AsSock>(socket: &S) {
+    let sock = socket.sock_ref();
+    let _ = sock.set_recv_buffer_size(RECV_BUFFER);
+    let _ = sock.set_send_buffer_size(SEND_BUFFER);
+    tracing::debug!(
+        recv = sock.recv_buffer_size().unwrap_or(0),
+        send = sock.send_buffer_size().unwrap_or(0),
+        "socket buffers"
+    );
+}
+
+/// Lets [`size_buffers`] take both std and tokio sockets.
+pub mod socket2_ref {
+    pub trait AsSock {
+        fn sock_ref(&self) -> socket2::SockRef<'_>;
+    }
+    impl AsSock for std::net::UdpSocket {
+        fn sock_ref(&self) -> socket2::SockRef<'_> {
+            socket2::SockRef::from(self)
+        }
+    }
+    impl AsSock for tokio::net::UdpSocket {
+        fn sock_ref(&self) -> socket2::SockRef<'_> {
+            socket2::SockRef::from(self)
+        }
+    }
+}
+
+/// The node's one socket: a QUIC endpoint, plus a second handle on the very
+/// same UDP socket for sending hole-punching packets.
+///
+/// Punch packets must leave from the port the coordination server saw, or
+/// they open a NAT mapping nobody is aiming at. QUIC does not send arbitrary
+/// datagrams outside a connection, so BARK keeps a duplicate handle of the
+/// socket QUIC reads from and sends the punches through that. The punches are
+/// eight bytes that no QUIC implementation can mistake for a packet (see
+/// `peer::PUNCH_PACKET`), so the receiving endpoint simply drops them — their
+/// only job is the NAT state they leave behind on the way out.
+pub struct NodeSocket {
+    pub endpoint: Endpoint,
+    raw: Arc<std::net::UdpSocket>,
+}
+
+impl NodeSocket {
+    pub fn bind(
+        bind: SocketAddr,
+        credentials: &TransportCredentials,
+        client_crypto: rustls::ClientConfig,
+    ) -> Result<Self> {
+        let server_crypto = credentials.server_config()?;
+        let quic_server = QuicServerConfig::try_from(server_crypto)
+            .map_err(|e| BarkError::Crypto(format!("TLS is not usable for QUIC: {e}")))?;
+        let mut server_config = ServerConfig::with_crypto(Arc::new(quic_server));
+        server_config.transport_config(Arc::new(transport_config(Role::Session)));
+
+        let socket = std::net::UdpSocket::bind(bind).map_err(|e| {
+            BarkError::Network(format!(
+                "Could not open a network port on {bind}: {e}\n\n\
+                 Possible causes:\n\
+                 \u{2022} Another program is already using that port\n\
+                 \u{2022} Windows Firewall blocked BARK from listening"
+            ))
+        })?;
+        socket.set_nonblocking(true)?;
+        size_buffers(&socket);
+        let raw = socket.try_clone()?;
+
+        let mut endpoint = Endpoint::new(
+            quinn::EndpointConfig::default(),
+            Some(server_config),
+            socket,
+            Arc::new(quinn::TokioRuntime),
+        )
+        .map_err(|e| BarkError::Network(format!("Could not start networking on {bind}: {e}")))?;
+
+        let quic_client = QuicClientConfig::try_from(client_crypto)
+            .map_err(|e| BarkError::Crypto(format!("TLS is not usable for QUIC: {e}")))?;
+        let mut client_config = ClientConfig::new(Arc::new(quic_client));
+        client_config.transport_config(Arc::new(transport_config(Role::Session)));
+        endpoint.set_default_client_config(client_config);
+
+        Ok(NodeSocket { endpoint, raw: Arc::new(raw) })
+    }
+
+    /// The handle punches are sent through.
+    pub fn raw(&self) -> Arc<std::net::UdpSocket> {
+        self.raw.clone()
+    }
+
+    pub fn local_address(&self) -> Result<SocketAddr> {
+        local_address(&self.endpoint)
+    }
+}
+
+/// Server settings for accepting a connection from another BARK device.
+pub fn session_server_config(credentials: &TransportCredentials) -> Result<ServerConfig> {
+    let quic_server = QuicServerConfig::try_from(credentials.server_config()?)
+        .map_err(|e| BarkError::Crypto(format!("TLS is not usable for QUIC: {e}")))?;
+    let mut server_config = ServerConfig::with_crypto(Arc::new(quic_server));
+    server_config.transport_config(Arc::new(transport_config(Role::Session)));
+    Ok(server_config)
+}
+
+/// Client settings for connecting to another BARK device: encryption only,
+/// session tuning. The peer is authenticated afterwards by the handshake in
+/// [`crate::peer`], never by this.
+pub fn session_client_config() -> Result<ClientConfig> {
+    let crypto = crate::tls::transport_only_client_config()?;
+    let quic_client = QuicClientConfig::try_from(crypto)
+        .map_err(|e| BarkError::Crypto(format!("TLS is not usable for QUIC: {e}")))?;
+    let mut config = ClientConfig::new(Arc::new(quic_client));
+    config.transport_config(Arc::new(transport_config(Role::Session)));
+    Ok(config)
 }
 
 /// Creates an endpoint that only makes outgoing connections.
@@ -319,6 +455,16 @@ mod tests {
 
         let result = connect(&client, server_addr, "the test server").await;
         assert!(result.is_err(), "connecting with a wrong pin must fail");
+    }
+
+    #[test]
+    fn session_sockets_get_large_buffers() {
+        let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let before = socket2::SockRef::from(&s).recv_buffer_size().unwrap();
+        size_buffers(&s);
+        let after = socket2::SockRef::from(&s).recv_buffer_size().unwrap();
+        eprintln!("receive buffer: Windows default {before} bytes, BARK sets {after} bytes");
+        assert!(after >= RECV_BUFFER, "Windows granted only {after} bytes");
     }
 
     #[tokio::test]

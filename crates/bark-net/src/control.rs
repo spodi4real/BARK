@@ -190,6 +190,12 @@ impl ControlConnection {
         &self.greeting
     }
 
+    /// The server's address as this connection reaches it. A relay run by
+    /// the server that listens on "any address" is reached at this IP.
+    pub fn server_address(&self) -> SocketAddr {
+        self.connection.remote_address()
+    }
+
     /// Our address as the server sees it.
     pub fn public_address(&self) -> SocketAddr {
         self.greeting.our_public_address

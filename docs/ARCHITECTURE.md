@@ -121,6 +121,19 @@ To connect Controller (A) to Target (B):
 This succeeds for the large majority of real-world networks (full-cone, restricted-cone, and
 port-restricted NATs, and most symmetric NATs when only one side is symmetric).
 
+**As built (2026-09-22), `bark-net::peer`:** B punches (8-byte packets QUIC discards, sent every
+40 ms for 5 s from its one socket, via a duplicate handle of the socket QUIC uses) *before*
+answering, so its NAT is open by the time A dials. A then starts a QUIC connection to every
+candidate at once; LAN candidates get a 30 ms head start, applied only when there is a LAN
+candidate. First to complete wins; the rest are dropped. Direct attempts are given 4 s. B only
+completes a handshake with a device it accepted an introduction from in the last 60 s (the
+"gate"); an incoming connection with nothing expected is refused before any TLS work.
+
+Limitation to know: the server can only report the address it *sees*. A BARK server inside the
+office sees office machines by their LAN addresses, so from outside the office there is no public
+address to punch towards and sessions use the relay. Hole punching across the internet needs the
+coordination server (or a small reflector) on a public address.
+
 ---
 
 ## 6. Relay fallback
@@ -157,6 +170,24 @@ connection between themselves; the relay just moves its packets from one side to
 
 Hole punching **continues in the background** on a relayed session; if a direct path appears, a
 new direct connection is established and the session moves to it (planned; see project state).
+
+**As built (2026-09-22), two refinements of the steps above:**
+
+* *One socket per relayed session, not the node's main socket.* A plain forwarder can tell
+  sessions apart only by sender address. With the main socket, two relayed sessions through the
+  same relay (two people controlling one server, or one controller with two remotes) would be
+  indistinguishable. Each peer therefore binds a fresh socket to the relay for each relayed
+  session. Hole punching still uses the main socket, where it has to.
+* *Tokens instead of signed tickets, for now.* The relay runs inside the coordination-server role,
+  in the same process, so the server hands each peer a random single-use token over its
+  authenticated control connection and the relay checks it against shared memory. Tokens are
+  issued only for a connection the target accepted within the last 60 s. Server-signed tickets
+  (step 2 above) become necessary when relays run on other machines, which is not built yet.
+
+Controls implemented and tested: 32 sessions per relay, 60 Mbit/s per session per direction
+(token bucket, quarter-second burst), unbound allocations expire after 30 s and silent sessions
+after 60 s, no answer at all to unknown senders or forged tokens, a bound side cannot be taken
+over, every allocation audited.
 
 UDP blocked entirely (some guest Wi-Fi) is not handled in the first version; a TCP/TLS fallback on
 port 443 is planned.
@@ -451,9 +482,60 @@ dead session.
   with conservative defaults. Idle bindings expire.
 * **Audited.** Every relay allocation is recorded in the coordination server's audit log.
 
+### As built (2026-09-22)
+
+Relaying runs on the coordination-server machine only (selection step 1). Relay-capable nodes
+other than the server (step 2), capacity announcement and relay failover are designed above but
+not built. The Settings checkbox is enabled only on the server computer and says so.
+
 ### Known limitation
 
 The coordination server itself is a single point of failure for *discovery*: if it is offline,
 devices cannot find each other or be introduced. Sessions already running are unaffected. Planned
 mitigations: nodes remember a peer's last working direct address and try it first, and a second
 coordination server can be designated later.
+
+---
+
+## 18. Video pipeline as built (2026-09-22)
+
+* **Capture:** DXGI Desktop Duplication, one monitor (the first). BARK copies each new frame into
+  its own texture at once and releases Windows' copy. The pointer shape travels separately
+  (including inverting cursors such as the text I-beam, sent with XOR semantics) and becomes the
+  controller's local hardware cursor. "Access lost" (UAC prompt, lock screen, mode change) reopens
+  capture and tells the controller why the picture paused.
+* **Convert:** Direct3D 11 video processor, BT.709 limited range on the YUV side, set explicitly
+  in both directions.
+* **Encode:** Media Foundation. The graphics card's hardware H.264 encoder where it accepts the
+  settings (asynchronous MFTs, driven by a small event thread), otherwise Windows' software
+  encoder. Low-latency mode, constant bitrate, no B-frames, keyframes on request (loss, decoder
+  reset, "Refresh Picture"). Starting bitrate ~0.08 bit/pixel/frame within 4-40 Mbit/s. Three NV12
+  textures in rotation so the encoder never reads a frame being overwritten.
+* **Pacing (remote):** at most 60 frames a second; changes arriving faster are merged into the
+  next frame, never queued. Nothing is sent while the screen is still.
+* **Transport:** frames split into QUIC datagrams (`bark-proto::video`). No second encryption
+  layer (section 12). The controller asks for a keyframe on any lost frame, at most five times a
+  second. Session sockets use 8 MB receive / 4 MB send buffers (Windows' 64 KB default dropped
+  keyframe bursts; see MEASUREMENTS.md).
+* **Decode and display:** Windows' H.264 decoder in low-latency mode with DXVA (GPU), a
+  flip-model swap chain with tearing allowed, presented the moment a frame decodes, picture kept
+  to its shape with black bars.
+* **Timer resolution:** BARK requests 1 ms timer resolution and opts out of Windows 11 ignoring
+  that request for hidden windows. Measured: the Intel encoder went from ~30 ms to ~8 ms a frame.
+* **Input:** controller window messages (mouse, wheel, keys as scancodes) are sent the moment
+  they arrive; the remote applies them with `SendInput` on a dedicated thread and remembers held
+  keys so everything is released when focus is lost or the session ends. Raw Input, the Windows
+  key and Alt+Tab (which Windows intercepts before any window sees them) are not forwarded yet;
+  the Actions menu sends them instead. Ctrl+Alt+Del needs the service (SendSAS), not built.
+* **Latency figures** in the session window are all measured: QUIC's RTT estimate; remote time
+  from the frame reaching the remote screen (DXGI's own present timestamp) to sending; decode and
+  present; and input-to-frame — the remote stamps each frame with the controller's own clock
+  reading of the last input it applied, so no clock synchronisation is involved.
+* **Visibility:** the controlled computer shows a topmost notice naming the controller with an
+  End Session button, for as long as the session lasts. It cannot be closed except by ending the
+  session.
+
+Not built: the Windows service and session agent (so no sign-in screen, lock screen or elevated
+windows yet — standalone mode is subject to Windows' UIPI), multiple monitors in one session,
+monitor switching in the UI, adaptive bitrate from network feedback, clipboard, file transfer,
+the TCP/443 fallback.

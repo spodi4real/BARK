@@ -470,6 +470,70 @@ const ID_SET_JOIN: i32 = 306;
 const ID_SET_INCOMING: i32 = 307;
 const ID_SET_CLIPBOARD: i32 = 308;
 const ID_SET_RELAY: i32 = 309;
+const ID_SET_COPY: i32 = 310;
+const ID_SET_FIREWALL: i32 = 311;
+const ID_SET_RELAY_HINT: i32 = 312;
+
+/// Reads a server address and key out of pasted join information, in the
+/// form the server's Settings shows (and copies) it.
+pub fn parse_join(text: &str) -> (Option<String>, Option<String>) {
+    let mut address = None;
+    let mut key = None;
+    for line in text.lines() {
+        let lower = line.to_ascii_lowercase();
+        if let Some((_, value)) = line.split_once(':') {
+            let value = value.trim().to_string();
+            if lower.contains("address") && !value.is_empty() {
+                address = Some(value);
+            } else if lower.contains("key") && !value.is_empty() {
+                key = Some(value);
+            }
+        }
+    }
+    // A bare key on its own also works.
+    if key.is_none() {
+        let hex: String = text.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+        if hex.len() == 64 {
+            key = Some(text.trim().to_string());
+        }
+    }
+    (address, key)
+}
+
+/// Adds a Windows Firewall rule letting other computers reach this BARK.
+/// Needs administrator rights, so Windows asks (UAC) first.
+fn allow_in_firewall(owner: HWND) {
+    let Ok(exe) = std::env::current_exe() else { return };
+    let exe = exe.to_string_lossy().to_string();
+    let rule = "BARK Remote Access";
+    let args = format!(
+        "/c netsh advfirewall firewall delete rule name=\"{rule}\" >nul & \
+         netsh advfirewall firewall add rule name=\"{rule}\" dir=in action=allow protocol=UDP \
+         program=\"{exe}\" enable=yes profile=any"
+    );
+    let verb = Wide::new("runas");
+    let file = Wide::new("cmd.exe");
+    let params = Wide::new(&args);
+    let r = unsafe {
+        windows::Win32::UI::Shell::ShellExecuteW(
+            Some(owner),
+            verb.pcwstr(),
+            file.pcwstr(),
+            params.pcwstr(),
+            windows::core::PCWSTR::null(),
+            SW_HIDE,
+        )
+    };
+    if (r.0 as isize) <= 32 {
+        error_box(Some(owner), "The firewall rule was not added (Windows did not get administrator permission).");
+    } else {
+        info_box(
+            Some(owner),
+            "Windows Firewall now lets other computers reach BARK on this computer.\n\n\
+             BARK still refuses every connection that is not from a device paired with this computer.",
+        );
+    }
+}
 
 struct Settings {
     original: NodeConfig,
@@ -480,13 +544,24 @@ impl Settings {
         let is_server = is_checked(dlg, ID_SET_IS_SERVER);
         enable(dlg_item(dlg, ID_SET_ADDRESS), !is_server);
         enable(dlg_item(dlg, ID_SET_KEY), !is_server);
+        // In this version the relay runs as part of the server.
+        enable(dlg_item(dlg, ID_SET_RELAY), is_server);
+        set_dlg_text(
+            dlg,
+            ID_SET_RELAY_HINT,
+            if is_server {
+                "Uses this computer's upload bandwidth, only when a direct connection fails."
+            } else {
+                "Only the BARK server computer can relay in this version."
+            },
+        );
+        set_dlg_text(dlg, ID_SET_COPY, if is_server { "&Copy" } else { "&Paste" });
         let status = app::status();
         let join = status.as_ref().and_then(|s| s.server_role.as_ref());
         let loopback_only = join.is_some_and(|r| r.listening.starts_with("127."));
         let (hint, text) = match (is_server, join) {
             (true, Some(r)) if loopback_only => (
-                "This server only listens on this computer (127.0.0.1). Other computers cannot reach it."
-                    .to_string(),
+                "Listens on 127.0.0.1 only, so other computers cannot reach this server.".to_string(),
                 format!("Server key:  {}", r.key_text),
             ),
             (true, Some(r)) => (
@@ -528,16 +603,47 @@ impl Dialog for Settings {
         set_checked(dlg, ID_SET_INCOMING, c.accept_incoming);
         set_checked(dlg, ID_SET_CLIPBOARD, c.clipboard_sync);
         set_checked(dlg, ID_SET_RELAY, c.roles.relay);
-        // Relaying is not built yet. The option is shown, disabled, so its
-        // place in the layout can be judged — it does nothing.
-        enable(dlg_item(dlg, ID_SET_RELAY), false);
         self.sync_enabled(dlg);
     }
 
     fn command(&mut self, dlg: HWND, id: i32, _code: u16) -> bool {
         match id {
             ID_SET_IS_SERVER => {
+                // A new server relays by default (ARCHITECTURE.md s.17).
+                if is_checked(dlg, ID_SET_IS_SERVER) && !self.original.roles.coordination_server {
+                    set_checked(dlg, ID_SET_RELAY, true);
+                }
                 self.sync_enabled(dlg);
+                true
+            }
+            ID_SET_COPY => {
+                if is_checked(dlg, ID_SET_IS_SERVER) {
+                    let text = dlg_text(dlg, ID_SET_JOIN);
+                    if !text.trim().is_empty() && copy_to_clipboard(dlg, &text) {
+                        info_box(Some(dlg), "The address and key are on the clipboard. Paste them into Settings on the other computer (Paste button).");
+                    }
+                } else {
+                    match clipboard_text(dlg).map(|t| parse_join(&t)) {
+                        Some((address, key)) if address.is_some() || key.is_some() => {
+                            if let Some(a) = address {
+                                set_dlg_text(dlg, ID_SET_ADDRESS, &a);
+                            }
+                            if let Some(k) = key {
+                                set_dlg_text(dlg, ID_SET_KEY, &k);
+                            }
+                        }
+                        _ => error_box(
+                            Some(dlg),
+                            "The clipboard does not contain BARK join information.\n\n\
+                             On the BARK server computer open Tools > Settings and press Copy, then \
+                             bring that text to this computer.",
+                        ),
+                    }
+                }
+                true
+            }
+            ID_SET_FIREWALL => {
+                allow_in_firewall(dlg);
                 true
             }
             IDOK_ => {
@@ -553,6 +659,7 @@ impl Dialog for Settings {
                 };
                 c.accept_incoming = is_checked(dlg, ID_SET_INCOMING);
                 c.clipboard_sync = is_checked(dlg, ID_SET_CLIPBOARD);
+                c.roles.relay = c.roles.coordination_server && is_checked(dlg, ID_SET_RELAY);
                 if let Err(e) = c.validate() {
                     error_box(Some(dlg), &e.to_string());
                     return true;
@@ -570,7 +677,7 @@ impl Dialog for Settings {
 
 pub fn settings(owner: HWND) {
     let Some(status) = app::status() else { return };
-    let t = Template::new("Settings", 300, 246)
+    let t = Template::new("Settings", 300, 262)
         .label_right("Device name:", 7, 9, 60, 8)
         .edit(ID_SET_NAME, 72, 7, 130, 13, 0)
         .label("(blank = computer name)", -1, 207, 9, 90, 8)
@@ -580,16 +687,18 @@ pub fn settings(owner: HWND) {
         .edit(ID_SET_ADDRESS, 79, 52, 130, 13, 0)
         .label_right("Server key:", 14, 70, 60, 8)
         .edit(ID_SET_KEY, 79, 68, 207, 13, 0)
+        .button("&Paste", ID_SET_COPY, 236, 51, 50, false)
         .label("", ID_SET_HINT, 14, 86, 272, 8)
         .report(ID_SET_JOIN, 14, 97, 272, 26)
-        .group("This computer", 7, 134, 286, 76)
+        .group("This computer", 7, 134, 286, 94)
         .check("Allow paired devices to control this computer", ID_SET_INCOMING, 14, 146, 270)
         .check("Synchronise the clipboard during sessions", ID_SET_CLIPBOARD, 14, 160, 270)
         .check("Relay connections for other BARK devices", ID_SET_RELAY, 14, 174, 270)
-        .label("Relaying is not built in this version.", -1, 26, 187, 250, 8)
-        .rule(7, 220, 286)
-        .button("OK", IDOK_, 189, 226, 50, true)
-        .button("Cancel", IDCANCEL_, 243, 226, 50, false)
+        .label("", ID_SET_RELAY_HINT, 26, 187, 260, 8)
+        .button("Allow in Windows &Firewall...", ID_SET_FIREWALL, 14, 204, 120, false)
+        .rule(7, 236, 286)
+        .button("OK", IDOK_, 189, 242, 50, true)
+        .button("Cancel", IDCANCEL_, 243, 242, 50, false)
         .finish();
     run(owner, t, Box::new(Settings { original: status.config }));
 }
@@ -784,17 +893,42 @@ pub fn diagnostics_report(status: &NodeStatus) -> String {
         }
     }
     match &status.server_role {
-        Some(r) => check(
-            o,
-            Some(true),
-            "Coordination server role",
-            &format!("listening on {}, {} online / {} known", r.listening, r.devices_online, r.devices_known),
-        ),
+        Some(r) => {
+            check(
+                o,
+                Some(true),
+                "Coordination server role",
+                &format!("listening on {}, {} online / {} known", r.listening, r.devices_online, r.devices_known),
+            );
+            match &r.relay {
+                Some(addr) => check(o, Some(true), "Relay role", &format!("listening on {addr} (UDP)")),
+                None => check(o, None, "Relay role", "off (Tools > Settings)"),
+            }
+        }
         None => check(o, None, "Coordination server role", "off (another computer is the server)"),
     }
-    check(o, None, "Direct connection test", "not built in this version");
-    check(o, None, "Relay test", "not built in this version");
-    check(o, None, "NAT traversal test", "not built in this version");
+    line(o, "");
+    if status.sessions.is_empty() {
+        line(o, "  Sessions        none running");
+    } else {
+        for (i, s) in status.sessions.iter().enumerate() {
+            let dir = if s.controlling { "controlling" } else { "controlled by" };
+            line(
+                o,
+                &format!(
+                    "  {}{dir} {}  {}  {}  since {}",
+                    if i == 0 { "Sessions        " } else { "                " },
+                    s.device_name,
+                    s.path,
+                    s.remote_address,
+                    bark_node::api::format_date_time(s.started_unix_us)
+                ),
+            );
+        }
+    }
+    line(o, "");
+    line(o, "  Live figures for a session (round trip, frame rate, latency) are in");
+    line(o, "  its window's status bar.");
     out
 }
 
@@ -980,6 +1114,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn join_information_pastes_from_what_the_server_copies() {
+        let copied = "Server address:  192.168.1.10:57411\r\nServer key:  AB12-CD34-EF56-7890-AB12-CD34-EF56-7890-AB12-CD34-EF56-7890-AB12-CD34-EF56-7890";
+        let (a, k) = parse_join(copied);
+        assert_eq!(a.as_deref(), Some("192.168.1.10:57411"));
+        assert!(k.unwrap().starts_with("AB12-CD34"));
+        let (a, k) = parse_join("  ab12cd34ef567890ab12cd34ef567890ab12cd34ef567890ab12cd34ef567890 ");
+        assert!(a.is_none());
+        assert!(k.is_some(), "a bare 64-digit key is recognised");
+        assert_eq!(parse_join("hello world"), (None, None));
+    }
+
+    #[test]
     fn templates_are_dword_aligned_and_count_their_items() {
         let t = Template::new("X", 100, 50)
             .label("a", 1, 0, 0, 10, 10)
@@ -1007,11 +1153,12 @@ mod tests {
             server_role: None,
             config: NodeConfig::default(),
             local_addresses: vec!["192.168.1.5 (Ethernet)".into()],
+            sessions: vec![],
         };
         let r = diagnostics_report(&status);
         assert!(r.contains("[FAIL]  BARK server configured"));
         assert!(r.contains("Tools > Settings"), "says what to do");
-        assert!(r.contains("not built in this version"), "is honest about gaps");
+        assert!(r.contains("Sessions        none running"));
         assert!(r.contains("192.168.1.5"));
     }
 }

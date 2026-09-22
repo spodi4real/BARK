@@ -201,3 +201,31 @@ pub fn copy_to_clipboard(owner: HWND, text: &str) -> bool {
         ok
     }
 }
+
+/// Reads text from the clipboard, for "Paste" in Settings.
+pub fn clipboard_text(owner: HWND) -> Option<String> {
+    use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
+    use windows::Win32::Foundation::HGLOBAL;
+    use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
+    const CF_UNICODETEXT: u32 = 13;
+    unsafe {
+        OpenClipboard(Some(owner)).ok()?;
+        let text = (|| {
+            let h = GetClipboardData(CF_UNICODETEXT).ok()?;
+            let mem = HGLOBAL(h.0);
+            let p = GlobalLock(mem) as *const u16;
+            if p.is_null() {
+                return None;
+            }
+            let mut len = 0;
+            while *p.add(len) != 0 {
+                len += 1;
+            }
+            let s = String::from_utf16_lossy(std::slice::from_raw_parts(p, len));
+            let _ = GlobalUnlock(mem);
+            Some(s)
+        })();
+        let _ = CloseClipboard();
+        text
+    }
+}
